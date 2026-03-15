@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/option"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 
@@ -51,6 +52,9 @@ func (r *ruleSetItemTestRouter) NeedFindNeighbor() bool                     { re
 func (r *ruleSetItemTestRouter) NeighborResolver() adapter.NeighborResolver { return nil }
 func (r *ruleSetItemTestRouter) AppendTracker(adapter.ConnectionTracker)    {}
 func (r *ruleSetItemTestRouter) ResetNetwork()                              {}
+func (r *ruleSetItemTestRouter) UpdateRules([]option.Rule, []option.RuleSet) error {
+	return nil
+}
 
 type countingRuleSet struct {
 	name string

@@ -21,6 +21,16 @@ type Inbound interface {
 	Tag() string
 }
 
+type UpdatableInbound[T any] interface {
+	Inbound
+	UpdateUsers(users []T) error
+}
+
+type UpdatableShadowsocksInbound interface {
+	Inbound
+	UpdateUsersByOptions(users []option.ShadowsocksUser) error
+}
+
 type TCPInjectableInbound interface {
 	Inbound
 	ConnectionHandler
