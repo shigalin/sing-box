@@ -249,6 +249,93 @@ func (r *Router) NeedFindProcess() bool {
 	return r.needFindProcess
 }
 
+func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) error {
+	newRules := make([]adapter.Rule, 0, len(rules))
+	for i, options := range rules {
+		rule, err := R.NewRule(r.ctx, r.logger, options, false)
+		if err != nil {
+			return E.Cause(err, "parse rule[", i, "]")
+		}
+		newRules = append(newRules, rule)
+	}
+
+	newRuleSets := make([]adapter.RuleSet, 0, len(ruleSets))
+	newRuleSetMap := make(map[string]adapter.RuleSet)
+	for i, options := range ruleSets {
+		if _, exists := newRuleSetMap[options.Tag]; exists {
+			return E.New("duplicate rule-set tag: ", options.Tag)
+		}
+		ruleSet, err := R.NewRuleSet(r.ctx, r.logger, options)
+		if err != nil {
+			return E.Cause(err, "parse rule-set[", i, "]")
+		}
+		newRuleSets = append(newRuleSets, ruleSet)
+		newRuleSetMap[options.Tag] = ruleSet
+	}
+
+	if r.started {
+		var cacheContext *adapter.HTTPStartContext
+		if len(newRuleSets) > 0 {
+			cacheContext = adapter.NewHTTPStartContext(r.ctx)
+			var ruleSetStartGroup task.Group
+			for i, ruleSet := range newRuleSets {
+				ruleSetInPlace := ruleSet
+				ruleSetStartGroup.Append0(func(ctx context.Context) error {
+					err := ruleSetInPlace.StartContext(ctx, cacheContext)
+					if err != nil {
+						return E.Cause(err, "initialize rule-set[", i, "]")
+					}
+					return nil
+				})
+			}
+			ruleSetStartGroup.Concurrency(5)
+			ruleSetStartGroup.FastFail()
+			err := ruleSetStartGroup.Run(r.ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if cacheContext != nil {
+			cacheContext.Close()
+		}
+
+		for i, rule := range newRules {
+			err := rule.Start()
+			if err != nil {
+				return E.Cause(err, "initialize rule[", i, "]")
+			}
+		}
+		for _, ruleSet := range newRuleSets {
+			err := ruleSet.PostStart()
+			if err != nil {
+				return E.Cause(err, "post start rule_set[", ruleSet.Name(), "]")
+			}
+		}
+
+		oldRules := r.rules
+		oldRuleSets := r.ruleSets
+
+		r.rules = newRules
+		r.ruleSets = newRuleSets
+		r.ruleSetMap = newRuleSetMap
+
+		r.network.Initialize(r.ruleSets)
+
+		for _, rule := range oldRules {
+			rule.Close()
+		}
+		for _, ruleSet := range oldRuleSets {
+			ruleSet.Close()
+		}
+	} else {
+		r.rules = newRules
+		r.ruleSets = newRuleSets
+		r.ruleSetMap = newRuleSetMap
+	}
+
+	return nil
+}
+
 func (r *Router) NeedFindNeighbor() bool {
 	return r.needFindNeighbor
 }
