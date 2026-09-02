@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -24,9 +26,12 @@ import (
 	mierucommon "github.com/enfein/mieru/v3/apis/common"
 	mieruconstant "github.com/enfein/mieru/v3/apis/constant"
 	mierumodel "github.com/enfein/mieru/v3/apis/model"
-	mieruserver "github.com/enfein/mieru/v3/apis/server"
 	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
+	mieruappctl "github.com/enfein/mieru/v3/pkg/appctl/appctlcommon"
 	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
+	mierunet "github.com/enfein/mieru/v3/pkg/common"
+	mierulog "github.com/enfein/mieru/v3/pkg/log"
+	mieruprotocol "github.com/enfein/mieru/v3/pkg/protocol"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -34,36 +39,45 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.MieruInboundOptions](registry, C.TypeMieru, NewInbound)
 }
 
+// disableMieruLog mirrors what mieru's own server API does on construction:
+// mieru logs through its global logger, which would otherwise print to stderr.
+var disableMieruLog = sync.OnceFunc(func() {
+	mierulog.SetFormatter(&mierulog.NilFormatter{})
+})
+
+// Inbound drives mieru's server multiplexer directly instead of going through
+// the apis/server wrapper: the wrapper only applies users at Start, while the
+// multiplexer can take a new user set at runtime, which UpdateUsers needs.
 type Inbound struct {
 	inbound.Adapter
-	ctx       context.Context
-	router    adapter.ConnectionRouterEx
-	logger    log.ContextLogger
-	listener  *listener.Listener
-	server    mieruserver.Server
-	userNames []string
+	ctx      context.Context
+	router   adapter.ConnectionRouterEx
+	logger   log.ContextLogger
+	listener *listener.Listener
+	config   *mieruMuxConfig
+	running  atomic.Bool
 
-	mu sync.Mutex
+	// mu guards mux and serverUsers. The multiplexer runs a background
+	// cleaner from construction, so it is only created in Start, where the
+	// scope closes it; until then UpdateUsers only records the users.
+	mu          sync.Mutex
+	mux         *mieruprotocol.Mux
+	serverUsers map[string]*mierupb.User
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MieruInboundOptions) (adapter.Inbound, error) {
-	config, userNames, err := buildMieruServerConfig(ctx, options)
+	config, err := newMieruMuxConfig(options)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build mieru server config: %w", err)
-	}
-
-	s := mieruserver.NewServer()
-	if err := s.Store(config); err != nil {
-		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
+		return nil, fmt.Errorf("failed to build mieru server: %w", err)
 	}
 
 	inboundInstance := &Inbound{
-		Adapter:   inbound.NewAdapter(C.TypeMieru, tag),
-		ctx:       ctx,
-		router:    uot.NewRouter(router, logger),
-		logger:    logger,
-		server:    s,
-		userNames: userNames,
+		Adapter:     inbound.NewAdapter(C.TypeMieru, tag),
+		ctx:         ctx,
+		router:      uot.NewRouter(router, logger),
+		logger:      logger,
+		config:      config,
+		serverUsers: buildMieruUsers(options.Users),
 	}
 	inboundInstance.listener = listener.New(listener.Options{
 		Context: ctx,
@@ -83,13 +97,17 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if err := h.server.Start(); err != nil {
+	mux := h.config.newMux(h.serverUsers)
+	if err := mux.Start(); err != nil {
+		mux.Close()
 		return fmt.Errorf("failed to start mieru server: %w", err)
 	}
+	h.mux = mux
+	h.running.Store(true)
 	scope.Add(h.Close)
 
 	h.logger.Info("mieru server is started")
-	go h.acceptLoop()
+	go h.acceptLoop(mux)
 	return nil
 }
 
@@ -97,17 +115,18 @@ func (h *Inbound) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if h.server.IsRunning() {
-		return h.server.Stop()
+	h.running.Store(false)
+	if h.mux == nil {
+		return nil
 	}
-	return nil
+	return h.mux.Close()
 }
 
-func (h *Inbound) acceptLoop() {
+func (h *Inbound) acceptLoop(mux *mieruprotocol.Mux) {
 	for {
-		conn, request, err := h.server.Accept()
+		conn, request, err := h.accept(mux)
 		if err != nil {
-			if !h.server.IsRunning() {
+			if !h.running.Load() {
 				return
 			}
 			h.logger.Debug("failed to accept mieru connection: ", err)
@@ -115,6 +134,28 @@ func (h *Inbound) acceptLoop() {
 		}
 		go h.handleConnection(conn, request)
 	}
+}
+
+// accept waits for a proxy connection and reads its SOCKS5 request, the same
+// way mieru's server API does before handing the connection to the caller.
+func (h *Inbound) accept(mux *mieruprotocol.Mux) (net.Conn, *mierumodel.Request, error) {
+	conn, err := mux.Accept()
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := conn.(mierucommon.UserContext); !ok {
+		conn.Close()
+		return nil, nil, E.New("connection doesn't implement UserContext interface")
+	}
+
+	mierunet.SetReadTimeout(conn, 10*time.Second)
+	request := &mierumodel.Request{}
+	if err := request.ReadFromSocks5(conn); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	mierunet.SetReadTimeout(conn, 0)
+	return conn, request, nil
 }
 
 func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
@@ -263,9 +304,16 @@ func (c *mieruPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksadd
 	return err
 }
 
-func buildMieruServerConfig(_ context.Context, options option.MieruInboundOptions) (*mieruserver.ServerConfig, []string, error) {
+// mieruMuxConfig is the validated configuration a server multiplexer is
+// created from.
+type mieruMuxConfig struct {
+	endpoints      []mieruprotocol.UnderlayProperties
+	trafficPattern *mierutp.Config
+}
+
+func newMieruMuxConfig(options option.MieruInboundOptions) (*mieruMuxConfig, error) {
 	if err := validateMieruInboundOptions(options); err != nil {
-		return nil, nil, fmt.Errorf("failed to validate mieru options: %w", err)
+		return nil, fmt.Errorf("failed to validate mieru options: %w", err)
 	}
 
 	var transportProtocol *mierupb.TransportProtocol
@@ -277,7 +325,7 @@ func buildMieruServerConfig(_ context.Context, options option.MieruInboundOption
 	}
 
 	if options.ListenOptions.ListenPort == 0 {
-		return nil, nil, E.New("listen_port must be set")
+		return nil, E.New("listen_port must be set")
 	}
 	portBindings := []*mierupb.PortBinding{
 		{
@@ -285,25 +333,40 @@ func buildMieruServerConfig(_ context.Context, options option.MieruInboundOption
 			Protocol: transportProtocol,
 		},
 	}
+	endpoints, err := mieruappctl.PortBindingsToUnderlayProperties(portBindings, mierunet.DefaultMTU)
+	if err != nil {
+		return nil, err
+	}
 
-	var users []*mierupb.User
-	var userNames []string
-	for _, user := range options.Users {
-		users = append(users, &mierupb.User{
+	// Already validated above; Decode of an empty pattern yields nil, which
+	// NewConfig treats as the default pattern.
+	trafficPatternPB, _ := mierutp.Decode(options.TrafficPattern)
+	trafficPattern, err := mierutp.NewConfig(trafficPatternPB)
+	if err != nil {
+		return nil, fmt.Errorf("invalid traffic pattern: %w", err)
+	}
+
+	return &mieruMuxConfig{endpoints: endpoints, trafficPattern: trafficPattern}, nil
+}
+
+func (c *mieruMuxConfig) newMux(users map[string]*mierupb.User) *mieruprotocol.Mux {
+	disableMieruLog()
+	mux := mieruprotocol.NewMux(false)
+	mux.SetTrafficPattern(c.trafficPattern)
+	mux.SetServerUsers(users)
+	mux.SetEndpoints(c.endpoints)
+	return mux
+}
+
+func buildMieruUsers(users []option.MieruUser) map[string]*mierupb.User {
+	userMap := make(map[string]*mierupb.User, len(users))
+	for _, user := range users {
+		userMap[user.Name] = &mierupb.User{
 			Name:     proto.String(user.Name),
 			Password: proto.String(user.Password),
-		})
-		userNames = append(userNames, user.Name)
+		}
 	}
-	var trafficPattern *mierupb.TrafficPattern
-	trafficPattern, _ = mierutp.Decode(options.TrafficPattern)
-	return &mieruserver.ServerConfig{
-		Config: &mierupb.ServerConfig{
-			PortBindings:   portBindings,
-			Users:          users,
-			TrafficPattern: trafficPattern,
-		},
-	}, userNames, nil
+	return userMap
 }
 
 func validateMieruInboundOptions(options option.MieruInboundOptions) error {
@@ -313,13 +376,8 @@ func validateMieruInboundOptions(options option.MieruInboundOptions) error {
 	if len(options.Users) == 0 {
 		return E.New("users is empty")
 	}
-	for _, user := range options.Users {
-		if user.Name == "" {
-			return E.New("username is empty")
-		}
-		if user.Password == "" {
-			return E.New("password is empty")
-		}
+	if err := validateMieruUsers(options.Users); err != nil {
+		return err
 	}
 	if options.TrafficPattern != "" {
 		trafficPattern, err := mierutp.Decode(options.TrafficPattern)
@@ -328,6 +386,18 @@ func validateMieruInboundOptions(options option.MieruInboundOptions) error {
 		}
 		if err := mierutp.Validate(trafficPattern); err != nil {
 			return fmt.Errorf("invalid traffic pattern %q: %w", options.TrafficPattern, err)
+		}
+	}
+	return nil
+}
+
+func validateMieruUsers(users []option.MieruUser) error {
+	for _, user := range users {
+		if user.Name == "" {
+			return E.New("username is empty")
+		}
+		if user.Password == "" {
+			return E.New("password is empty")
 		}
 	}
 	return nil
