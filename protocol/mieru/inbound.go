@@ -55,6 +55,7 @@ type Inbound struct {
 	logger   log.ContextLogger
 	listener *listener.Listener
 	config   *mieruMuxConfig
+	users    atomic.Pointer[map[string]bool]
 	running  atomic.Bool
 
 	// mu guards mux and serverUsers. The multiplexer runs a background
@@ -79,6 +80,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		config:      config,
 		serverUsers: buildMieruUsers(options.Users),
 	}
+	inboundInstance.setUsers(options.Users)
 	inboundInstance.listener = listener.New(listener.Options{
 		Context: ctx,
 		Logger:  logger,
@@ -122,6 +124,18 @@ func (h *Inbound) Close() error {
 	return h.mux.Close()
 }
 
+func (h *Inbound) setUsers(users []option.MieruUser) {
+	userSet := make(map[string]bool, len(users))
+	for _, user := range users {
+		userSet[user.Name] = true
+	}
+	h.users.Store(&userSet)
+}
+
+func (h *Inbound) hasUser(name string) bool {
+	return (*h.users.Load())[name]
+}
+
 func (h *Inbound) acceptLoop(mux *mieruprotocol.Mux) {
 	for {
 		conn, request, err := h.accept(mux)
@@ -160,6 +174,19 @@ func (h *Inbound) accept(mux *mieruprotocol.Mux) (net.Conn, *mierumodel.Request,
 
 func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
 	ctx := log.ContextWithNewID(h.ctx)
+
+	// mieru authenticates a client once per underlay and keeps accepting
+	// sessions on it after the user was removed, so every connection is
+	// checked against the current user set.
+	var userName string
+	if userCtx, ok := conn.(mierucommon.UserContext); ok {
+		userName = userCtx.UserName()
+	}
+	if !h.hasUser(userName) {
+		conn.Close()
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		return
+	}
 
 	// Send fake SOCKS5 response back to proxy client.
 	resp := &mierumodel.Response{
@@ -202,10 +229,7 @@ func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
 		}
 	}
 
-	// Get username from connection.
-	if userCtx, ok := conn.(mierucommon.UserContext); ok {
-		metadata.User = userCtx.UserName()
-	}
+	metadata.User = userName
 
 	// Handle request.
 	switch request.Command {
