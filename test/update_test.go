@@ -15,12 +15,14 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/protocol/socks"
 
 	"github.com/gofrs/uuid/v5"
@@ -512,6 +514,39 @@ func TestRouterUpdateRules(t *testing.T) {
 	requireTCPWorks(t, updateClientPortA)
 	_, loaded := router.RuleSet("local")
 	require.False(t, loaded)
+}
+
+// TestRouterUpdateRulesNotifiesHooks checks that UpdateRules publishes the
+// new rule options and notifies registered hooks, which the reference
+// manager relies on to re-evaluate which outbounds are referenced.
+func TestRouterUpdateRulesNotifiesHooks(t *testing.T) {
+	const harmless = "10.255.255.255/32"
+	instance := startInstance(t, option.Options{
+		Inbounds:  []option.Inbound{mixedInbound(updateClientPortA)},
+		Outbounds: []option.Outbound{{Type: C.TypeDirect}},
+		Route: &option.RouteOptions{
+			RuleSet: []option.RuleSet{inlineIPRuleSet("blocked", harmless)},
+		},
+	})
+	router, isRouter := instance.Router().(*route.Router)
+	require.True(t, isRouter)
+	require.Empty(t, router.RuleOptions())
+
+	hook := observable.NewSubscriber[struct{}](1)
+	defer hook.Close()
+	router.AddRuleUpdateHook(hook)
+	subscription, done := hook.Subscription()
+
+	rules := rejectRuleSetRules("blocked")
+	require.NoError(t, router.UpdateRules(rules, []option.RuleSet{inlineIPRuleSet("blocked", harmless)}))
+	select {
+	case <-subscription:
+	case <-done:
+		t.Fatal("hook closed before notification")
+	case <-time.After(time.Second):
+		t.Fatal("UpdateRules did not notify hooks")
+	}
+	require.Equal(t, rules, router.RuleOptions())
 }
 
 func routerRuleSet(t *testing.T, router adapter.Router, tag string) adapter.RuleSet {
