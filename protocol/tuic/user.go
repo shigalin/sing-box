@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"github.com/sagernet/sing-box/common/usertable"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 
@@ -8,7 +9,7 @@ import (
 )
 
 func (h *Inbound) UpdateUsers(users []option.TUICUser) error {
-	userNameList := make([]string, 0, len(users))
+	userEntryList := make([]usertable.User, 0, len(users))
 	userUUIDList := make([][16]byte, 0, len(users))
 	userPasswordList := make([]string, 0, len(users))
 	for index, user := range users {
@@ -19,11 +20,11 @@ func (h *Inbound) UpdateUsers(users []option.TUICUser) error {
 		if err != nil {
 			return E.Cause(err, "invalid uuid for user ", index)
 		}
-		userNameList = append(userNameList, user.Name)
+		userEntryList = append(userEntryList, usertable.User{Key: usertable.Key(user.Name, userUUID.String(), user.Password), Name: user.Name})
 		userUUIDList = append(userUUIDList, userUUID)
 		userPasswordList = append(userPasswordList, user.Password)
 	}
-	userList := h.users.Update(userNameList)
+	userList := h.users.Update(userEntryList)
 	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
 	return nil
 }
