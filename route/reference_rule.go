@@ -66,9 +66,12 @@ func evaluateLogical(matches []staticMatch, logicalMode string, invert bool) sta
 	return match
 }
 
+// Rules built in code rather than parsed from JSON may leave Type empty; the
+// rule constructors read that as default, so the static evaluation must too,
+// or such a rule's outbound is not seen as referenced.
 func evaluateRule(rule option.Rule, mode string) staticMatch {
 	switch rule.Type {
-	case C.RuleTypeDefault:
+	case "", C.RuleTypeDefault:
 		conditions := rule.DefaultOptions.RawDefaultRule
 		conditions.ClashMode = ""
 		conditions.Invert = false
@@ -86,7 +89,7 @@ func evaluateRule(rule option.Rule, mode string) staticMatch {
 
 func evaluateDNSRule(rule option.DNSRule, mode string) staticMatch {
 	switch rule.Type {
-	case C.RuleTypeDefault:
+	case "", C.RuleTypeDefault:
 		conditions := rule.DefaultOptions.RawDefaultDNSRule
 		conditions.ClashMode = ""
 		conditions.Invert = false
@@ -110,11 +113,13 @@ func collectRuleReferences(rules []option.Rule, mode string, outbounds *[]string
 		}
 		var action option.RuleAction
 		switch rule.Type {
-		case C.RuleTypeDefault:
+		case "", C.RuleTypeDefault:
 			action = rule.DefaultOptions.RuleAction
 		case C.RuleTypeLogical:
 			action = rule.LogicalOptions.RuleAction
 		}
+		// An empty Action builds a nil action, which matches no case at
+		// runtime and falls through to the next rule, so it is not final.
 		var final bool
 		switch action.Action {
 		case C.RuleActionTypeRoute:
@@ -145,7 +150,7 @@ func collectDNSRuleReferences(rules []option.DNSRule, mode string, transports *[
 		}
 		var action option.DNSRuleAction
 		switch rule.Type {
-		case C.RuleTypeDefault:
+		case "", C.RuleTypeDefault:
 			action = rule.DefaultOptions.DNSRuleAction
 		case C.RuleTypeLogical:
 			action = rule.LogicalOptions.DNSRuleAction
