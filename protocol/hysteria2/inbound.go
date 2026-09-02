@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -36,12 +37,12 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router       adapter.Router
-	logger       log.ContextLogger
-	listener     *listener.Listener
-	tlsConfig    tls.ServerConfig
-	service      *hysteria2.Service[int]
-	userNameList []string
+	router    adapter.Router
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	tlsConfig tls.ServerConfig
+	service   *hysteria2.Service[int]
+	users     usertable.Table
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -206,17 +207,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	userList := make([]int, 0, len(options.Users))
-	userNameList := make([]string, 0, len(options.Users))
-	userPasswordList := make([]string, 0, len(options.Users))
-	for index, user := range options.Users {
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
-		userPasswordList = append(userPasswordList, user.Password)
-	}
-	hysteriaService.UpdateUsers(userList, userPasswordList)
 	inbound.service = hysteriaService
-	inbound.userNameList = userNameList
+	err = inbound.UpdateUsers(options.Users)
+	if err != nil {
+		return nil, err
+	}
 	return inbound, nil
 }
 
@@ -233,7 +228,13 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
@@ -255,7 +256,13 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {

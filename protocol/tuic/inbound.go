@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -20,8 +21,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	"github.com/gofrs/uuid/v5"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -30,12 +29,12 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router       adapter.ConnectionRouterEx
-	logger       log.ContextLogger
-	listener     *listener.Listener
-	tlsConfig    tls.ServerConfig
-	server       *tuic.Service[int]
-	userNameList []string
+	router    adapter.ConnectionRouterEx
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	tlsConfig tls.ServerConfig
+	server    *tuic.Service[int]
+	users     usertable.Table
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
@@ -87,26 +86,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	var userList []int
-	var userNameList []string
-	var userUUIDList [][16]byte
-	var userPasswordList []string
-	for index, user := range options.Users {
-		if user.UUID == "" {
-			return nil, E.New("missing uuid for user ", index)
-		}
-		userUUID, err := uuid.FromString(user.UUID)
-		if err != nil {
-			return nil, E.Cause(err, "invalid uuid for user ", index)
-		}
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
-		userUUIDList = append(userUUIDList, userUUID)
-		userPasswordList = append(userPasswordList, user.Password)
-	}
-	service.UpdateUsers(userList, userUUIDList, userPasswordList)
 	inbound.server = service
-	inbound.userNameList = userNameList
+	err = inbound.UpdateUsers(options.Users)
+	if err != nil {
+		return nil, err
+	}
 	return inbound, nil
 }
 
@@ -123,7 +107,13 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
@@ -145,7 +135,13 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {
