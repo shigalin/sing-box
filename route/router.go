@@ -20,6 +20,7 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
@@ -40,14 +41,20 @@ type Router struct {
 	network           adapter.NetworkManager
 	httpClientManager adapter.HTTPClientManager
 	rules             atomic.Pointer[[]adapter.Rule]
-	needFindProcess   bool
-	needFindNeighbor  bool
-	leaseFiles        []string
-	ruleSets          []adapter.RuleSet
-	ruleSetMap        map[string]adapter.RuleSet
-	ruleSetOptions    map[string]option.RuleSet
-	ruleSetTags       map[string]bool
-	dnsRuleSetTags    map[string]bool
+	// ruleOptions mirrors rules as options, for holders that evaluate rules
+	// statically, such as the reference manager. Both are replaced together
+	// by UpdateRules, which then notifies ruleUpdateHooks.
+	ruleOptions      atomic.Pointer[[]option.Rule]
+	ruleUpdateAccess sync.Mutex
+	ruleUpdateHooks  []*observable.Subscriber[struct{}]
+	needFindProcess  bool
+	needFindNeighbor bool
+	leaseFiles       []string
+	ruleSets         []adapter.RuleSet
+	ruleSetMap       map[string]adapter.RuleSet
+	ruleSetOptions   map[string]option.RuleSet
+	ruleSetTags      map[string]bool
+	dnsRuleSetTags   map[string]bool
 	// dnsRuleSets holds, per tag, the rule-set the DNS rules resolved at
 	// start. DNS rules keep matching against that object, so it must stay
 	// alive with its content until the router is closed, even after
@@ -102,6 +109,7 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 		ruleList = append(ruleList, rule)
 	}
 	r.rules.Store(&ruleList)
+	r.ruleOptions.Store(&rules)
 	r.ruleSetTags = collectRuleSetTags(rules, make(map[string]bool))
 	for i, options := range ruleSets {
 		for _, tag := range options.Tag {
@@ -395,10 +403,12 @@ func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) err
 		}
 	}
 	r.rules.Store(&newRules)
+	r.ruleOptions.Store(&rules)
 	r.ruleSets = newRuleSets
 	r.ruleSetOptions = newRuleSetOptions
 	r.ruleSetTags = collectRuleSetTags(rules, make(map[string]bool))
 	r.checkRuleRequirements(rules, newRuleSets)
+	r.notifyRulesUpdated()
 	var retiredRuleSets []adapter.RuleSet
 	for _, ruleSet := range oldRuleSets {
 		if reusedRuleSets[ruleSet] {
@@ -431,6 +441,31 @@ func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) err
 		ruleSet.Cleanup()
 	}
 	return nil
+}
+
+// RuleOptions returns the options of the rules currently in effect.
+func (r *Router) RuleOptions() []option.Rule {
+	rules := r.ruleOptions.Load()
+	if rules == nil {
+		return nil
+	}
+	return *rules
+}
+
+// AddRuleUpdateHook registers a subscriber that is notified after UpdateRules
+// published new rules.
+func (r *Router) AddRuleUpdateHook(hook *observable.Subscriber[struct{}]) {
+	r.ruleUpdateAccess.Lock()
+	defer r.ruleUpdateAccess.Unlock()
+	r.ruleUpdateHooks = append(r.ruleUpdateHooks, hook)
+}
+
+func (r *Router) notifyRulesUpdated() {
+	r.ruleUpdateAccess.Lock()
+	defer r.ruleUpdateAccess.Unlock()
+	for _, hook := range r.ruleUpdateHooks {
+		hook.Emit(struct{}{})
+	}
 }
 
 // reusableRuleSet returns the current rule-set with the given tag if it can

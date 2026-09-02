@@ -16,9 +16,13 @@ import (
 var _ adapter.LifecycleService = (*ReferenceManager)(nil)
 
 type ReferenceManager struct {
-	ctx                    context.Context
-	logger                 log.ContextLogger
+	ctx    context.Context
+	logger log.ContextLogger
+	// rules is the snapshot from the configuration; when the router is ours,
+	// the rules in effect are read from it instead, since UpdateRules can
+	// replace them at runtime.
 	rules                  []option.Rule
+	router                 *Router
 	dnsRules               []option.DNSRule
 	staticOutbounds        []string
 	staticTransports       []string
@@ -90,9 +94,20 @@ func (m *ReferenceManager) Start(stage adapter.StartStage) error {
 	if clashMode != nil {
 		clashMode.AddUpdateHook(m.subscriber)
 	}
+	if router, isRouter := service.FromContext[adapter.Router](m.ctx).(*Router); isRouter {
+		m.router = router
+		router.AddRuleUpdateHook(m.subscriber)
+	}
 	m.update()
 	go m.loop()
 	return nil
+}
+
+func (m *ReferenceManager) currentRules() []option.Rule {
+	if m.router != nil {
+		return m.router.RuleOptions()
+	}
+	return m.rules
 }
 
 func (m *ReferenceManager) Close() error {
@@ -137,7 +152,7 @@ func (m *ReferenceManager) update() {
 		}
 	}
 	transportQueue = append(transportQueue, networkManager.DefaultOptions().DomainResolver)
-	if !collectRuleReferences(m.rules, mode, &outboundQueue, &transportQueue) {
+	if !collectRuleReferences(m.currentRules(), mode, &outboundQueue, &transportQueue) {
 		defaultOutbound := outboundManager.Default()
 		if defaultOutbound != nil {
 			outboundQueue = append(outboundQueue, defaultOutbound.Tag())
