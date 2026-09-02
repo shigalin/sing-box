@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -11,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -41,9 +43,12 @@ type Inbound struct {
 	logger    logger.ContextLogger
 	listener  *listener.Listener
 	service   *vmess.Service[int]
-	users     []option.VMessUser
+	users     usertable.Table
 	tlsConfig tls.ServerConfig
 	transport adapter.V2RayServerTransport
+
+	updateAccess sync.Mutex
+	userOptions  []option.VMessUser
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
@@ -52,7 +57,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
-		users:   options.Users,
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -68,13 +72,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
 	inbound.service = service
-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.VMessUser) string {
-		return it.UUID
-	}), common.Map(options.Users, func(it option.VMessUser) int {
-		return it.AlterId
-	}))
+	err = inbound.UpdateUsers(options.Users)
 	if err != nil {
 		return nil, err
 	}
@@ -173,14 +171,19 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[int](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = F.ToString(userID)
 	} else {
 		metadata.User = user
 	}
@@ -191,14 +194,19 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[int](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, loaded := h.users.Name(userID)
+	if !loaded {
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = F.ToString(userID)
 	} else {
 		metadata.User = user
 	}

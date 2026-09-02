@@ -77,3 +77,23 @@ func TestTableDuplicateNames(t *testing.T) {
 	require.Equal(t, []int{1, 1, 2}, table.Update([]User{second, second, other}))
 	require.Equal(t, []int{3, 1, 2}, table.Update([]User{first, second, other}))
 }
+func TestTableRestore(t *testing.T) {
+	t.Parallel()
+	var table Table
+	require.Equal(t, []int{0, 1}, table.Update(users("a", "b")))
+	state := table.Save()
+	require.Equal(t, []int{1, 2}, table.Update(users("b", "c")))
+	table.Restore(state)
+	name, loaded := table.Name(0)
+	require.True(t, loaded)
+	require.Equal(t, "a", name)
+	_, loaded = table.Name(2)
+	require.False(t, loaded)
+	// IDs handed out after the snapshot are not reused: sessions may already
+	// carry ID 2 as "c", so a new user must not be able to claim it.
+	require.Equal(t, []int{0, 1, 3}, table.Update(users("a", "b", "d")))
+	_, loaded = table.Name(2)
+	require.False(t, loaded)
+	// The reverted user itself comes back under a fresh ID as well.
+	require.Equal(t, []int{0, 1, 3, 4}, table.Update(users("a", "b", "d", "c")))
+}

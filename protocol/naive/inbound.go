@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -47,7 +48,7 @@ type Inbound struct {
 	listener         *listener.Listener
 	network          []string
 	networkIsDefault bool
-	authenticator    *auth.Authenticator
+	authenticator    atomic.Pointer[auth.Authenticator]
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
 	h3Server         io.Closer
@@ -67,8 +68,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}),
 		networkIsDefault: options.Network == "",
 		network:          options.Network.Build(),
-		authenticator:    auth.NewAuthenticator(options.Users),
 	}
+	inbound.authenticator.Store(auth.NewAuthenticator(options.Users))
 	if common.Contains(inbound.network, N.NetworkUDP) {
 		if options.TLS == nil || !options.TLS.Enabled {
 			return nil, E.New("TLS is required for QUIC server")
@@ -162,7 +163,8 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
-		authOk = n.authenticator.Verify(userName, password)
+		authenticator := n.authenticator.Load()
+		authOk = authenticator != nil && authenticator.Verify(userName, password)
 	}
 	if !authOk {
 		rejectHTTP(writer, http.StatusProxyAuthRequired)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -11,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -40,8 +42,13 @@ type MultiInbound struct {
 	logger   logger.ContextLogger
 	listener *listener.Listener
 	service  shadowsocks.MultiService[int]
-	users    []option.ShadowsocksUser
-	tracker  adapter.SSMTracker
+	users    usertable.Table
+	// updateAccess serializes UpdateUsers, which must roll the service back
+	// to the last accepted user set (userIDs, userPSKs) if an update fails.
+	updateAccess sync.Mutex
+	userIDs      []int
+	userPSKs     []string
+	tracker      adapter.SSMTracker
 }
 
 func newMultiInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (*MultiInbound, error) {
@@ -83,18 +90,13 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
 	if err != nil {
 		return nil, err
 	}
+	inbound.service = service
 	if len(options.Users) > 0 {
-		err = service.UpdateUsersWithPasswords(common.MapIndexed(options.Users, func(index int, user option.ShadowsocksUser) int {
-			return index
-		}), common.Map(options.Users, func(user option.ShadowsocksUser) string {
-			return user.Password
-		}))
+		err = inbound.UpdateUsersByOptions(options.Users)
 		if err != nil {
 			return nil, err
 		}
 	}
-	inbound.service = service
-	inbound.users = options.Users
 	inbound.listener = listener.New(listener.Options{
 		Context:                  ctx,
 		Logger:                   logger,
@@ -123,17 +125,30 @@ func (h *MultiInbound) SetTracker(tracker adapter.SSMTracker) {
 }
 
 func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {
-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(users, func(index int, user string) int {
-		return index
-	}), uPSKs)
+	if len(users) != len(uPSKs) {
+		return E.New("user and password count mismatch")
+	}
+	userEntryList := make([]usertable.User, 0, len(users))
+	for i, user := range users {
+		userEntryList = append(userEntryList, usertable.User{Key: usertable.Key(user, uPSKs[i]), Name: user})
+	}
+	h.updateAccess.Lock()
+	defer h.updateAccess.Unlock()
+	state := h.users.Save()
+	userIDs := h.users.Update(userEntryList)
+	err := h.service.UpdateUsersWithPasswords(userIDs, uPSKs)
 	if err != nil {
+		// The service may have applied part of the new set before it
+		// rejected a password: put the last accepted set back, together with
+		// the user table that matches it.
+		h.users.Restore(state)
+		if rollbackErr := h.service.UpdateUsersWithPasswords(h.userIDs, h.userPSKs); rollbackErr != nil {
+			h.logger.Error(E.Cause(rollbackErr, "restore users after failed update"))
+		}
 		return err
 	}
-	h.users = common.Map(users, func(user string) option.ShadowsocksUser {
-		return option.ShadowsocksUser{
-			Name: user,
-		}
-	})
+	h.userIDs = userIDs
+	h.userPSKs = uPSKs
 	return nil
 }
 
@@ -159,13 +174,16 @@ func (h *MultiInbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
 }
 
 func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[int](ctx)
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	user, loaded := h.users.Name(userID)
+	if !loaded {
+		return E.New("user removed")
+	}
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = F.ToString(userID)
 	} else {
 		metadata.User = user
 	}
@@ -182,13 +200,16 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 }
 
 func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[int](ctx)
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	user, loaded := h.users.Name(userID)
+	if !loaded {
+		return E.New("user removed")
+	}
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = F.ToString(userID)
 	} else {
 		metadata.User = user
 	}

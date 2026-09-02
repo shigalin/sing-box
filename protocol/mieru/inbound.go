@@ -55,6 +55,7 @@ type Inbound struct {
 	logger   log.ContextLogger
 	listener *listener.Listener
 	mux      *mieruprotocol.Mux
+	users    atomic.Pointer[map[string]bool]
 	running  atomic.Bool
 
 	mu sync.Mutex
@@ -73,6 +74,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:  logger,
 		mux:     mux,
 	}
+	inboundInstance.setUsers(options.Users)
 	inboundInstance.listener = listener.New(listener.Options{
 		Context: ctx,
 		Logger:  logger,
@@ -109,6 +111,18 @@ func (h *Inbound) Close() error {
 	// Close is idempotent and also stops the multiplexer's background cleaner,
 	// which runs from construction, so close even if Start was never reached.
 	return h.mux.Close()
+}
+
+func (h *Inbound) setUsers(users []option.MieruUser) {
+	userSet := make(map[string]bool, len(users))
+	for _, user := range users {
+		userSet[user.Name] = true
+	}
+	h.users.Store(&userSet)
+}
+
+func (h *Inbound) hasUser(name string) bool {
+	return (*h.users.Load())[name]
 }
 
 func (h *Inbound) acceptLoop() {
@@ -149,6 +163,19 @@ func (h *Inbound) accept() (net.Conn, *mierumodel.Request, error) {
 
 func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
 	ctx := log.ContextWithNewID(h.ctx)
+
+	// mieru authenticates a client once per underlay and keeps accepting
+	// sessions on it after the user was removed, so every connection is
+	// checked against the current user set.
+	var userName string
+	if userCtx, ok := conn.(mierucommon.UserContext); ok {
+		userName = userCtx.UserName()
+	}
+	if !h.hasUser(userName) {
+		conn.Close()
+		h.logger.WarnContext(ctx, "reject connection from removed user")
+		return
+	}
 
 	// Send fake SOCKS5 response back to proxy client.
 	resp := &mierumodel.Response{
@@ -191,10 +218,7 @@ func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
 		}
 	}
 
-	// Get username from connection.
-	if userCtx, ok := conn.(mierucommon.UserContext); ok {
-		metadata.User = userCtx.UserName()
-	}
+	metadata.User = userName
 
 	// Handle request.
 	switch request.Command {

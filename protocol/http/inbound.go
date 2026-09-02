@@ -4,6 +4,7 @@ import (
 	std_bufio "bufio"
 	"context"
 	"net"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -31,17 +32,17 @@ type Inbound struct {
 	router        adapter.ConnectionRouterEx
 	logger        log.ContextLogger
 	listener      *listener.Listener
-	authenticator *auth.Authenticator
+	authenticator atomic.Pointer[auth.Authenticator]
 	tlsConfig     tls.ServerConfig
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPMixedInboundOptions) (adapter.Inbound, error) {
 	inbound := &Inbound{
-		Adapter:       inbound.NewAdapter(C.TypeHTTP, tag),
-		router:        uot.NewRouter(router, logger),
-		logger:        logger,
-		authenticator: auth.NewAuthenticator(options.Users),
+		Adapter: inbound.NewAdapter(C.TypeHTTP, tag),
+		router:  uot.NewRouter(router, logger),
+		logger:  logger,
 	}
+	inbound.authenticator.Store(auth.NewAuthenticator(options.Users))
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
 			Context:        ctx,
@@ -96,7 +97,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
-	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
+	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator.Load(), adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))

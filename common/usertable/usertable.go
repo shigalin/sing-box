@@ -75,3 +75,30 @@ func (t *Table) Name(id int) (string, bool) {
 	name, loaded := t.names[id]
 	return name, loaded
 }
+
+// State is a snapshot of a table, see Save.
+type State struct {
+	ids   map[string]int
+	names map[int]string
+}
+
+// Save returns the current user set of the table. Update never modifies the
+// maps of a saved state, so Restore can bring the table back to it after a
+// later Update turned out to be unusable, e.g. because the protocol service
+// rejected the credentials of the new user set.
+func (t *Table) Save() State {
+	t.access.RLock()
+	defer t.access.RUnlock()
+	return State{ids: t.ids, names: t.names}
+}
+
+// Restore brings the user set back to a saved state. The ID counter is not
+// rolled back: IDs handed out by the reverted Update may already have been
+// stored by sessions or passed to a protocol service, so reusing them would
+// let a later user inherit the identity of a user that was never installed.
+func (t *Table) Restore(state State) {
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.ids = state.ids
+	t.names = state.names
+}

@@ -76,3 +76,31 @@ func hasLocalNeighborDNSServer(servers []option.DNSServerOptions) bool {
 	}
 	return false
 }
+
+func collectRuleSetTags(rules []option.Rule, tags map[string]bool) map[string]bool {
+	for _, rule := range rules {
+		switch rule.Type {
+		case "", C.RuleTypeDefault:
+			for _, tag := range rule.DefaultOptions.RuleSet {
+				tags[tag] = true
+			}
+		case C.RuleTypeLogical:
+			collectRuleSetTags(rule.LogicalOptions.Rules, tags)
+		}
+	}
+	return tags
+}
+
+func collectDNSRuleSetTags(rules []option.DNSRule, tags map[string]bool) map[string]bool {
+	for _, rule := range rules {
+		switch rule.Type {
+		case "", C.RuleTypeDefault:
+			for _, tag := range rule.DefaultOptions.RuleSet {
+				tags[tag] = true
+			}
+		case C.RuleTypeLogical:
+			collectDNSRuleSetTags(rule.LogicalOptions.Rules, tags)
+		}
+	}
+	return tags
+}
