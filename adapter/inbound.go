@@ -47,11 +47,17 @@ type InboundRegistry interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) (Inbound, error)
 }
 
+// InboundManager also updates the inbounds of a running instance: Create
+// starts the inbound it adds and replaces a running inbound with the same
+// tag, Remove closes the inbound it removes, and Close closes every inbound
+// while the rest of the instance keeps running.
 type InboundManager interface {
 	Lifecycle
 	Inbounds() []Inbound
 	Get(tag string) (Inbound, bool)
+	Remove(tag string) error
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
+	Close() error
 }
 
 type InboundContext struct {
