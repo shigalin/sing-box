@@ -3,11 +3,16 @@ package shadowtls
 import (
 	"context"
 	"net"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -29,8 +34,14 @@ type Inbound struct {
 	router     adapter.Router
 	logger     logger.ContextLogger
 	listener   *listener.Listener
-	service    *shadowtls.Service
+	service    atomic.Pointer[shadowtls.Service]
 	references []string
+	// Set for a version 3 inbound, see UpdateUsers.
+	serviceConfig *shadowtls.ServiceConfig
+	users         usertable.Table
+	updateAccess  sync.Mutex
+	connAccess    sync.Mutex
+	conns         map[*userConn]struct{}
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowTLSInboundOptions) (adapter.Inbound, error) {
@@ -74,12 +85,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.Handshake.Detour != "" {
 		inbound.references = append(inbound.references, options.Handshake.Detour)
 	}
-	service, err := shadowtls.NewService(shadowtls.ServiceConfig{
+	serviceConfig := shadowtls.ServiceConfig{
 		Version:  options.Version,
 		Password: options.Password,
-		Users: common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
-			return shadowtls.User(it)
-		}),
 		Handshake: shadowtls.HandshakeConfig{
 			Server: options.Handshake.ServerOptions.Build(),
 			Dialer: handshakeDialer,
@@ -89,11 +97,22 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		WildcardSNI:            shadowtls.WildcardSNI(options.WildcardSNI),
 		Handler:                (*inboundHandler)(inbound),
 		Logger:                 logger,
-	})
+	}
+	if options.Version == 3 && len(options.Users) > 0 {
+		inbound.serviceConfig = &serviceConfig
+		inbound.conns = make(map[*userConn]struct{})
+		err = inbound.UpdateUsers(options.Users)
+	} else {
+		var service *shadowtls.Service
+		serviceConfig.Users = common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
+			return shadowtls.User(it)
+		})
+		service, err = shadowtls.NewService(serviceConfig)
+		inbound.service.Store(service)
+	}
 	if err != nil {
 		return nil, err
 	}
-	inbound.service = service
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -117,7 +136,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := h.service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
+	err := h.service.Load().NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
 		if E.IsClosedOrCanceled(err) {
@@ -139,7 +158,22 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
 	//nolint:staticcheck
 	metadata.Source = source
 	metadata.Destination = destination
-	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
+	userName, _ := auth.UserFromContext[string](ctx)
+	if h.serviceConfig != nil {
+		// The service knows version 3 users by their ID, see UpdateUsers.
+		userID, err := strconv.Atoi(userName)
+		if err != nil {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+		var loaded bool
+		conn, userName, loaded = (*Inbound)(h).trackConn(conn, userID)
+		if !loaded {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
