@@ -60,8 +60,8 @@ jobs:
 
       - name: Race-test patched dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: go test -mod=readonly -race -count=1 -timeout 3m github.com/sagernet/sing-vmess/... github.com/sagernet/sing-quic/...
+        run: go test -mod=readonly -race -count=1 -timeout 3m github.com/sagernet/sing-vmess/... github.com/sagernet/sing-quic/... github.com/sagernet/sing-snell/...
       - name: Race-test authentication and QUIC integration
         if: matrix.os == 'ubuntu-latest'
         working-directory: test
-        run: go test -mod=readonly -race -count=1 -tags with_quic -timeout 5m -run '^(TestQUICConcurrentUserUpdate|TestVLESSUpdateUsers|TestVMessUpdateUsers|TestHysteriaSelf|TestHysteria2Self|TestTUICSelf)$' .
+        run: go test -mod=readonly -race -count=1 -tags with_quic -timeout 5m -run '^(TestQUICConcurrentUserUpdate|TestVLESSUpdateUsers|TestVMessUpdateUsers|TestSnellUpdateUsers|TestSnellUpdateUsersReuse|TestSnellV6UpdateUsers|TestSnellV6UpdateUsersReuse|TestHysteriaSelf|TestHysteria2Self|TestTUICSelf)$' .

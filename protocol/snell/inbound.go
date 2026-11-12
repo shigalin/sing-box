@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -35,7 +37,10 @@ type Inbound struct {
 	logger   logger.ContextLogger
 	listener *listener.Listener
 	service  snellprotocol.Service
-	users    []option.SnellUser
+	// Set when the inbound was created with users, see UpdateUsers.
+	userService  userService
+	users        usertable.Table
+	updateAccess sync.Mutex
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
@@ -43,17 +48,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter: inbound.NewAdapter(C.TypeSnell, tag),
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
-		users:   options.Users,
-	}
-	var userList []int
-	var keyList [][]byte
-	if len(options.Users) > 0 {
-		userList = make([]int, len(options.Users))
-		keyList = make([][]byte, len(options.Users))
-		for index, user := range options.Users {
-			userList[index] = index
-			keyList[index] = []byte(user.UserKey)
-		}
 	}
 	var err error
 	switch options.Version {
@@ -74,8 +68,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			if err != nil {
 				return nil, err
 			}
-			err = service.UpdateUsers(userList, keyList)
 			inbound.service = service
+			inbound.userService = service
 		} else {
 			inbound.service, err = snellv5.NewService(serviceOptions)
 		}
@@ -96,8 +90,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			if err != nil {
 				return nil, err
 			}
-			err = service.UpdateUsers(userList, keyList)
 			inbound.service = service
+			inbound.userService = service
 		} else {
 			inbound.service, err = snellv6.NewService(serviceOptions)
 		}
@@ -108,6 +102,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if err != nil {
 		return nil, err
+	}
+	if inbound.userService != nil {
+		err = inbound.UpdateUsers(options.Users)
+		if err != nil {
+			return nil, err
+		}
 	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
@@ -168,15 +168,20 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	if len(h.users) > 0 {
-		userIndex, loaded := auth.UserFromContext[int](ctx)
+	if h.userService != nil {
+		userID, loaded := auth.UserFromContext[int](ctx)
 		if !loaded {
 			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 			return
 		}
-		user := h.users[userIndex].Name
+		// The user may have been removed since the request authenticated.
+		user, loaded := h.users.Name(userID)
+		if !loaded {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
 		if user == "" {
-			user = F.ToString(userIndex)
+			user = F.ToString(userID)
 		} else {
 			metadata.User = user
 		}
@@ -192,15 +197,20 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 	metadata.InboundType = h.Type()
 	// The snell client in Surge rejects UDP responses with domain addresses.
 	metadata.UDPDisableDomainUnmapping = true
-	if len(h.users) > 0 {
-		userIndex, loaded := auth.UserFromContext[int](ctx)
+	if h.userService != nil {
+		userID, loaded := auth.UserFromContext[int](ctx)
 		if !loaded {
 			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 			return
 		}
-		user := h.users[userIndex].Name
+		// The user may have been removed since the request authenticated.
+		user, loaded := h.users.Name(userID)
+		if !loaded {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
 		if user == "" {
-			user = F.ToString(userIndex)
+			user = F.ToString(userID)
 		} else {
 			metadata.User = user
 		}
