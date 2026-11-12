@@ -27,7 +27,6 @@ import (
 	mieruconstant "github.com/enfein/mieru/v3/apis/constant"
 	mierumodel "github.com/enfein/mieru/v3/apis/model"
 	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
-	mieruappctl "github.com/enfein/mieru/v3/pkg/appctl/appctlcommon"
 	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
 	mierunet "github.com/enfein/mieru/v3/pkg/common"
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
@@ -340,27 +339,24 @@ func newMieruMuxConfig(options option.MieruInboundOptions) (*mieruMuxConfig, err
 		return nil, fmt.Errorf("failed to validate mieru options: %w", err)
 	}
 
-	var transportProtocol *mierupb.TransportProtocol
-	switch options.Transport {
-	case "TCP":
-		transportProtocol = mierupb.TransportProtocol_TCP.Enum()
-	case "UDP":
-		transportProtocol = mierupb.TransportProtocol_UDP.Enum()
-	}
-
 	if options.ListenOptions.ListenPort == 0 {
 		return nil, E.New("listen_port must be set")
 	}
-	portBindings := []*mierupb.PortBinding{
-		{
-			Port:     proto.Int32(int32(options.ListenOptions.ListenPort)),
-			Protocol: transportProtocol,
-		},
+	// mieru's own port binding helper always binds the catch-all address, so
+	// the endpoint is built here to honor the listen address.
+	listenIP := net.ParseIP(mierunet.AllIPAddr())
+	if options.ListenOptions.Listen != nil {
+		listenIP = netip.Addr(*options.ListenOptions.Listen).AsSlice()
 	}
-	endpoints, err := mieruappctl.PortBindingsToUnderlayProperties(portBindings, mierunet.DefaultMTU)
-	if err != nil {
-		return nil, err
+	listenPort := int(options.ListenOptions.ListenPort)
+	var endpoint mieruprotocol.UnderlayProperties
+	switch options.Transport {
+	case "TCP":
+		endpoint = mieruprotocol.NewUnderlayProperties(mierunet.DefaultMTU, mierunet.StreamTransport, &net.TCPAddr{IP: listenIP, Port: listenPort}, nil)
+	case "UDP":
+		endpoint = mieruprotocol.NewUnderlayProperties(mierunet.DefaultMTU, mierunet.PacketTransport, &net.UDPAddr{IP: listenIP, Port: listenPort}, nil)
 	}
+	endpoints := []mieruprotocol.UnderlayProperties{endpoint}
 
 	// Already validated above; Decode of an empty pattern yields nil, which
 	// NewConfig treats as the default pattern.

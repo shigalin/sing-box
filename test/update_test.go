@@ -509,6 +509,16 @@ func TestRouterUpdateRules(t *testing.T) {
 	require.Same(t, blocking, ruleSet("blocked"))
 	requireTCPFails(t, updateClientPortA)
 
+	// Rules that are the first to need process information are rejected:
+	// nothing was set up at start to serve them.
+	// The rule leaves its type empty, as rules built in code may.
+	processRules := rejectRuleSetRules("blocked")
+	processRules[0].Type = ""
+	processRules[0].DefaultOptions.ProcessName = []string{"sing-box-test"}
+	require.ErrorIs(t, router.UpdateRules(processRules, []option.RuleSet{inlineIPRuleSet("blocked", harmless), local}), adapter.ErrRestartRequired)
+	require.Same(t, blocking, ruleSet("blocked"))
+	requireTCPFails(t, updateClientPortA)
+
 	// Dropping a rule-set retires it; the instance closes it on shutdown.
 	require.NoError(t, router.UpdateRules(rejectRuleSetRules("blocked"), []option.RuleSet{inlineIPRuleSet("blocked", harmless)}))
 	requireTCPWorks(t, updateClientPortA)
@@ -626,4 +636,43 @@ func TestRouterUpdateRulesWithDNSRuleSet(t *testing.T) {
 	require.NoError(t, router.UpdateRules(rejectRuleSetRules("shared"), []option.RuleSet{localRuleSet("shared", loopbackPath)}))
 	require.Same(t, current, routerRuleSet(t, router, "shared"))
 	requireTCPFails(t, updateClientPortA)
+}
+
+// TestRouterUpdateRulesConcurrent checks that updates can race with each
+// other and with rule-set lookups, and that a closed router refuses them.
+func TestRouterUpdateRulesConcurrent(t *testing.T) {
+	const harmless = "10.255.255.255/32"
+	const loopback = "127.0.0.1/32"
+	rules := rejectRuleSetRules("blocked")
+	instance := startInstance(t, option.Options{
+		Inbounds:  []option.Inbound{mixedInbound(updateClientPortA)},
+		Outbounds: []option.Outbound{{Type: C.TypeDirect}},
+		Route: &option.RouteOptions{
+			Rules:   rules,
+			RuleSet: []option.RuleSet{inlineIPRuleSet("blocked", harmless)},
+		},
+	})
+	router := instance.Router()
+	var group sync.WaitGroup
+	for worker := range 4 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := range 20 {
+				cidr := harmless
+				if (worker+i)%2 == 0 {
+					cidr = loopback
+				}
+				require.NoError(t, router.UpdateRules(rules, []option.RuleSet{inlineIPRuleSet("blocked", cidr)}))
+				_, loaded := router.RuleSet("blocked")
+				require.True(t, loaded)
+			}
+		}()
+	}
+	group.Wait()
+	require.NoError(t, router.UpdateRules(rules, []option.RuleSet{inlineIPRuleSet("blocked", harmless)}))
+	requireTCPWorks(t, updateClientPortA)
+
+	require.NoError(t, instance.Close())
+	require.ErrorIs(t, router.UpdateRules(rules, []option.RuleSet{inlineIPRuleSet("blocked", harmless)}), os.ErrClosed)
 }

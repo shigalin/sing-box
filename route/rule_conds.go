@@ -8,7 +8,7 @@ import (
 func hasRule(rules []option.Rule, cond func(rule option.DefaultRule) bool) bool {
 	for _, rule := range rules {
 		switch rule.Type {
-		case C.RuleTypeDefault:
+		case "", C.RuleTypeDefault:
 			if cond(rule.DefaultOptions) {
 				return true
 			}
@@ -24,7 +24,7 @@ func hasRule(rules []option.Rule, cond func(rule option.DefaultRule) bool) bool 
 func hasDNSRule(rules []option.DNSRule, cond func(rule option.DefaultDNSRule) bool) bool {
 	for _, rule := range rules {
 		switch rule.Type {
-		case C.RuleTypeDefault:
+		case "", C.RuleTypeDefault:
 			if cond(rule.DefaultOptions) {
 				return true
 			}

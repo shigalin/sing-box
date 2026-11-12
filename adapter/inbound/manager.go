@@ -111,10 +111,13 @@ func (m *Manager) Remove(tag string) error {
 	return scope.CloseChild(inbound)
 }
 
-// Create creates an inbound and adds it. If the manager is started, the
-// inbound is started through the stages the manager has reached, and then
-// replaces a running inbound with the same tag; if it fails to start, it is
-// closed and the manager is left as it was.
+// Create creates an inbound and adds it. If the manager is started, a running
+// inbound with the same tag is closed first, so that the new one can take over
+// its listen address, and the new inbound is started through the stages the
+// manager has reached. If it fails to start, it is closed, and the inbound it
+// was to replace stays closed and is removed: the manager does not know the
+// users that inbound had been updated to, so creating it again from what it
+// was created from could let removed users back in. The caller restores it.
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
 	inbound, err := m.registry.Create(ctx, router, logger, tag, inboundType, options)
 	if err != nil {
@@ -132,34 +135,64 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 		if loaded {
 			return E.New("duplicate inbound tag: ", tag)
 		}
-		m.inbounds = append(m.inbounds, inbound)
-		m.inboundByTag[tag] = inbound
+		m.addLocked(inbound)
 		return nil
 	}
 	m.access.Unlock()
+	var closeErr error
+	if loaded {
+		closeErr = scope.CloseChild(existing)
+		if closeErr != nil {
+			closeErr = E.Cause(closeErr, "close ", inboundName(existing))
+		}
+	}
+	err = startInbound(scope, stage, inbound)
+	m.access.Lock()
+	defer m.access.Unlock()
+	if err != nil {
+		if loaded {
+			m.removeLocked(existing)
+		}
+		return E.Errors(err, closeErr)
+	}
+	if loaded {
+		m.replaceLocked(existing, inbound)
+	} else {
+		m.addLocked(inbound)
+	}
+	return closeErr
+}
+
+// startInbound starts the inbound through the stages up to stage, and closes
+// it again if one of them fails.
+func startInbound(scope *adapter.Scope, stage adapter.StartStage, inbound adapter.Inbound) error {
 	for _, startStage := range adapter.ListStartStages {
 		if startStage > stage {
 			break
 		}
-		err = scope.Start(inboundName(inbound), inbound, startStage)
+		err := scope.Start(inboundName(inbound), inbound, startStage)
 		if err != nil {
 			return E.Errors(err, scope.CloseChild(inbound))
 		}
 	}
-	if loaded {
-		err = scope.CloseChild(existing)
-		if err != nil {
-			err = E.Cause(err, "close ", inboundName(existing))
-		}
-	}
-	m.access.Lock()
-	if loaded {
-		m.removeLocked(existing)
-	}
+	return nil
+}
+
+func (m *Manager) addLocked(inbound adapter.Inbound) {
 	m.inbounds = append(m.inbounds, inbound)
-	m.inboundByTag[tag] = inbound
-	m.access.Unlock()
-	return err
+	m.inboundByTag[inbound.Tag()] = inbound
+}
+
+// replaceLocked puts the inbound in the place of one with the same tag, so
+// that the order of the inbounds is kept.
+func (m *Manager) replaceLocked(existing adapter.Inbound, inbound adapter.Inbound) {
+	index := slices.Index(m.inbounds, existing)
+	if index == -1 {
+		panic("invalid inbound index")
+	}
+	m.inbounds = slices.Clone(m.inbounds)
+	m.inbounds[index] = inbound
+	m.inboundByTag[inbound.Tag()] = inbound
 }
 
 // removeLocked builds a new list, since Inbounds hands the current one out.
@@ -167,7 +200,7 @@ func (m *Manager) removeLocked(inbound adapter.Inbound) {
 	delete(m.inboundByTag, inbound.Tag())
 	index := slices.Index(m.inbounds, inbound)
 	if index == -1 {
-		return
+		panic("invalid inbound index")
 	}
 	m.inbounds = slices.Delete(slices.Clone(m.inbounds), index, index+1)
 }

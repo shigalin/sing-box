@@ -64,8 +64,15 @@ type Scope struct {
 	cancel   context.CancelFunc
 	logger   log.ContextLogger
 	access   sync.Mutex
-	cleanups []func() error
+	cleanups []*scopeCleanup
 	children map[Lifecycle]*Scope
+}
+
+// scopeCleanup is a cleanup of a scope; child is set if it closes the scope
+// of a component, so that CloseChild can find and drop it.
+type scopeCleanup struct {
+	run   func() error
+	child *Scope
 }
 
 func NewScope(ctx context.Context, logger log.ContextLogger) *Scope {
@@ -84,7 +91,7 @@ func (s *Scope) Context() context.Context {
 
 func (s *Scope) Add(cleanup func() error) {
 	s.access.Lock()
-	s.cleanups = append(s.cleanups, cleanup)
+	s.cleanups = append(s.cleanups, &scopeCleanup{run: cleanup})
 	s.access.Unlock()
 }
 
@@ -99,7 +106,7 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 	if !loaded {
 		child = NewScope(s.ctx, s.logger)
 		s.children[component] = child
-		s.cleanups = append(s.cleanups, func() error {
+		s.cleanups = append(s.cleanups, &scopeCleanup{child: child, run: func() error {
 			done := LogElapsed(s.logger, "close ", name)
 			monitor := taskmonitor.New(s.logger, C.StopTimeout)
 			monitor.Start("close ", name)
@@ -110,7 +117,7 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 				return E.Cause(closeErr, "close ", name)
 			}
 			return nil
-		})
+		}})
 	}
 	s.access.Unlock()
 	done := LogElapsed(s.logger, stage, " ", name)
@@ -127,12 +134,16 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 
 // CloseChild closes the scope of a component that was started through Start
 // and forgets it, so that the component can be removed while this scope keeps
-// running. Closing this scope afterwards finds nothing left to close for it.
+// running. Its cleanup is dropped from this scope too, so that components
+// which come and go do not accumulate here.
 func (s *Scope) CloseChild(component Lifecycle) error {
 	s.access.Lock()
 	child, loaded := s.children[component]
 	if loaded {
 		delete(s.children, component)
+		s.cleanups = slices.DeleteFunc(s.cleanups, func(it *scopeCleanup) bool {
+			return it.child == child
+		})
 	}
 	s.access.Unlock()
 	if !loaded {
@@ -150,7 +161,7 @@ func (s *Scope) Close() error {
 	s.access.Unlock()
 	var cleanupErrors []error
 	for _, cleanup := range slices.Backward(cleanups) {
-		cleanupErrors = append(cleanupErrors, E.Expand(cleanup())...)
+		cleanupErrors = append(cleanupErrors, E.Expand(cleanup.run())...)
 	}
 	return E.Errors(common.Filter(cleanupErrors, func(it error) bool {
 		return !E.IsClosed(it) && !E.IsCanceled(it)

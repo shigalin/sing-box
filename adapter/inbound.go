@@ -50,7 +50,9 @@ type InboundRegistry interface {
 // InboundManager also updates the inbounds of a running instance: Create
 // starts the inbound it adds and replaces a running inbound with the same
 // tag, Remove closes the inbound it removes, and Close closes every inbound
-// while the rest of the instance keeps running.
+// while the rest of the instance keeps running. If a replacement fails to
+// start, the inbound it was to replace is gone: the caller, which knows the
+// users in effect, creates it again.
 type InboundManager interface {
 	Lifecycle
 	Inbounds() []Inbound

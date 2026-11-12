@@ -46,6 +46,16 @@ type Router struct {
 	// by UpdateRules, which then notifies ruleUpdateHooks.
 	ruleOptions      atomic.Pointer[[]option.Rule]
 	ruleUpdateAccess sync.Mutex
+	// updateAccess serializes UpdateRules with itself and with the cleanups
+	// that close the rules and rule-sets, after which closed is set and
+	// updates are refused. ruleSetAccess guards ruleSetMap, which RuleSet
+	// reads while an update replaces it.
+	updateAccess sync.Mutex
+	closed       bool
+	// ruleRequirements is what the rules in effect need, see
+	// checkRuleRequirements.
+	ruleRequirements ruleRequirements
+	ruleSetAccess    sync.RWMutex
 	ruleUpdateHooks  []*observable.Subscriber[struct{}]
 	needFindProcess  bool
 	needFindNeighbor bool
@@ -251,7 +261,18 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if r.ruleSetUpdater != nil {
 			r.ruleSetUpdater.Start()
 		}
+		r.updateAccess.Lock()
+		r.ruleRequirements = ruleRequirements{
+			process:  hasRule(r.RuleOptions(), isProcessRule),
+			neighbor: hasRule(r.RuleOptions(), isNeighborRule),
+		}
+		for _, ruleSet := range r.ruleSets {
+			if ruleSet.Metadata().ContainsProcessRule {
+				r.ruleRequirements.process = true
+			}
+		}
 		r.started = true
+		r.updateAccess.Unlock()
 		return nil
 	case adapter.StartStateStarted:
 		for _, ruleSet := range r.ruleSets {
@@ -263,6 +284,9 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (r *Router) closeRules() error {
+	r.updateAccess.Lock()
+	defer r.updateAccess.Unlock()
+	r.closed = true
 	var err error
 	for i, rule := range r.Rules() {
 		err = E.Append(err, rule.Close(), func(err error) error {
@@ -274,6 +298,9 @@ func (r *Router) closeRules() error {
 }
 
 func (r *Router) closeRuleSetUpdater() error {
+	r.updateAccess.Lock()
+	defer r.updateAccess.Unlock()
+	r.closed = true
 	if r.ruleSetUpdater == nil {
 		return nil
 	}
@@ -281,6 +308,9 @@ func (r *Router) closeRuleSetUpdater() error {
 }
 
 func (r *Router) closeRuleSets() error {
+	r.updateAccess.Lock()
+	defer r.updateAccess.Unlock()
+	r.closed = true
 	var err error
 	for i, ruleSet := range r.ruleSets {
 		err = E.Append(err, ruleSet.Close(), func(err error) error {
@@ -296,6 +326,8 @@ func (r *Router) closeRuleSets() error {
 }
 
 func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
+	r.ruleSetAccess.RLock()
+	defer r.ruleSetAccess.RUnlock()
 	ruleSet, loaded := r.ruleSetMap[tag]
 	return ruleSet, loaded
 }
@@ -324,7 +356,13 @@ func (r *Router) NeedFindProcess() bool {
 // the new set before they are published; if anything fails, the router keeps
 // its current rules and rule-sets. Replaced rules and rule-sets are closed
 // after a grace period, once connections matched against them have finished.
+// Updates are applied one at a time, and refused once the router is closing.
 func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) error {
+	r.updateAccess.Lock()
+	defer r.updateAccess.Unlock()
+	if r.closed {
+		return os.ErrClosed
+	}
 	newRules := make([]adapter.Rule, 0, len(rules))
 	for i, options := range rules {
 		err := R.ValidateNoNestedRuleActions(options)
@@ -372,13 +410,20 @@ func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) err
 			return err
 		}
 	}
+	requirements, err := r.checkRuleRequirements(rules, newRuleSets)
+	if err != nil {
+		closeRuleSets(createdRuleSets)
+		return err
+	}
 	oldRules := r.Rules()
 	oldRuleSets := r.ruleSets
 	oldRuleSetMap := r.ruleSetMap
 	oldRuleSetUpdater := r.ruleSetUpdater
 	// Rules resolve their rule-sets when they start, so the new map must be
 	// in place before the new rules start.
+	r.ruleSetAccess.Lock()
 	r.ruleSetMap = newRuleSetMap
+	r.ruleSetAccess.Unlock()
 	if r.started {
 		for i, rule := range newRules {
 			err := rule.Start()
@@ -386,7 +431,9 @@ func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) err
 				for _, startedRule := range newRules[:i+1] {
 					startedRule.Close()
 				}
+				r.ruleSetAccess.Lock()
 				r.ruleSetMap = oldRuleSetMap
+				r.ruleSetAccess.Unlock()
 				closeRuleSets(createdRuleSets)
 				return E.Cause(err, "initialize rule[", i, "]")
 			}
@@ -397,7 +444,12 @@ func (r *Router) UpdateRules(rules []option.Rule, ruleSets []option.RuleSet) err
 	r.ruleSets = newRuleSets
 	r.ruleSetOptions = newRuleSetOptions
 	r.ruleSetTags = collectRuleSetTags(rules, make(map[string]bool))
-	r.checkRuleRequirements(rules, newRuleSets)
+	r.ruleRequirements = requirements
+	if !r.started {
+		// The searcher and the resolver are set up at start if needed.
+		r.needFindProcess = r.needFindProcess || requirements.process
+		r.needFindNeighbor = r.needFindNeighbor || requirements.neighbor
+	}
 	r.notifyRulesUpdated()
 	var retiredRuleSets []adapter.RuleSet
 	for _, ruleSet := range oldRuleSets {
@@ -515,28 +567,63 @@ func closeRuleSets(ruleSets []adapter.RuleSet) {
 	}
 }
 
-// checkRuleRequirements records what the new rules need. The process searcher
-// and the neighbor resolver are only created at start, so rules that need one
-// of them cannot be served if it was not needed at start.
-func (r *Router) checkRuleRequirements(rules []option.Rule, ruleSets []adapter.RuleSet) {
-	needFindProcess := hasRule(rules, isProcessRule)
+// ruleRequirements is what a set of route rules needs from the router.
+type ruleRequirements struct {
+	process  bool
+	neighbor bool
+}
+
+// checkRuleRequirements reports what the new rules need. The process searcher
+// and the neighbor resolver are only set up at start, and only if something
+// needed them then, so once the router is started, rules that need one that
+// is not there would be installed and never match:
+//
+//   - if nothing needed it at start, it was never set up, and the rules are
+//     rejected with adapter.ErrRestartRequired as the cause;
+//   - if it was needed at start but could not be set up, a restart would not
+//     help, and the rules are rejected with
+//     adapter.ErrRuleRequirementUnavailable as the cause;
+//   - unless the rules they replace needed it as well: start accepts such
+//     rules with a warning, and so does the update, so that the other rules
+//     of an instance in that state can still be updated.
+func (r *Router) checkRuleRequirements(rules []option.Rule, ruleSets []adapter.RuleSet) (ruleRequirements, error) {
+	requirements := ruleRequirements{
+		process:  hasRule(rules, isProcessRule),
+		neighbor: hasRule(rules, isNeighborRule),
+	}
+	if !r.started {
+		return requirements, nil
+	}
+	// Rule-set metadata is only loaded once the rule-set is started.
 	for _, ruleSet := range ruleSets {
 		if ruleSet.Metadata().ContainsProcessRule {
-			needFindProcess = true
+			requirements.process = true
 		}
 	}
-	if needFindProcess {
-		r.needFindProcess = true
-		if r.started && r.processSearcher == nil {
-			r.logger.Warn("rules need process information, but no process searcher was created at start: these rules will not match")
+	if requirements.process && r.processSearcher == nil {
+		err := r.missingRequirement("process information", r.needFindProcess, r.ruleRequirements.process)
+		if err != nil {
+			return requirements, err
 		}
 	}
-	if hasRule(rules, isNeighborRule) {
-		r.needFindNeighbor = true
-		if r.started && r.neighborResolver == nil {
-			r.logger.Warn("rules need neighbor information, but no neighbor resolver was created at start: these rules will not match")
+	if requirements.neighbor && r.neighborResolver == nil {
+		err := r.missingRequirement("neighbor information", r.needFindNeighbor, r.ruleRequirements.neighbor)
+		if err != nil {
+			return requirements, err
 		}
 	}
+	return requirements, nil
+}
+
+func (r *Router) missingRequirement(name string, wantedAtStart bool, neededByCurrentRules bool) error {
+	if !wantedAtStart {
+		return E.Cause(adapter.ErrRestartRequired, "rules need ", name, ", which was not set up at start")
+	}
+	if !neededByCurrentRules {
+		return E.Cause(adapter.ErrRuleRequirementUnavailable, "rules need ", name)
+	}
+	r.logger.Warn("rules need ", name, ", which is not available: these rules will not match")
+	return nil
 }
 
 // ruleRetireDelay is how long replaced rules and rule-sets stay usable after

@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 
 	"github.com/stretchr/testify/require"
@@ -53,6 +55,9 @@ func TestInboundManagerUpdate(t *testing.T) {
 		cancel()
 	})
 	manager := instance.Inbound()
+	tags := func() []string {
+		return common.Map(manager.Inbounds(), adapter.Inbound.Tag)
+	}
 	create := func(inbound option.Inbound) error {
 		logger := instance.LogFactory().NewLogger("inbound/" + inbound.Type + "[" + inbound.Tag + "]")
 		return manager.Create(ctx, instance.Router(), logger, inbound.Tag, inbound.Type, inbound.Options)
@@ -70,15 +75,33 @@ func TestInboundManagerUpdate(t *testing.T) {
 	require.NoError(t, create(mixedInbound(inboundManagerPortA)))
 	testTCP(t, inboundManagerPortA, updateTestPort)
 
-	// Create with the tag of a running inbound replaces it.
+	// Create with the tag of a running inbound replaces it, also on the port
+	// the running one listens on.
+	previous, loaded := manager.Get("mixed-in")
+	require.True(t, loaded)
+	require.NoError(t, create(mixedInbound(inboundManagerPortA)))
+	testTCP(t, inboundManagerPortA, updateTestPort)
+	current, loaded := manager.Get("mixed-in")
+	require.True(t, loaded)
+	require.NotSame(t, previous, current)
 	require.NoError(t, create(mixedInbound(inboundManagerPortB)))
 	testTCP(t, inboundManagerPortB, updateTestPort)
 	requireNotListening(t, inboundManagerPortA)
 	require.Len(t, manager.Inbounds(), 1)
-	current, loaded := manager.Get("mixed-in")
-	require.True(t, loaded)
 
-	// An inbound that fails to start is not added and replaces nothing.
+	// A replacement takes the place of the inbound it replaces.
+	first := mixedInbound(inboundManagerPortA)
+	first.Tag = "first"
+	require.NoError(t, create(first))
+	require.NoError(t, manager.Remove("mixed-in"))
+	require.NoError(t, create(mixedInbound(inboundManagerPortB)))
+	require.Equal(t, []string{"first", "mixed-in"}, tags())
+	require.NoError(t, create(first))
+	require.Equal(t, []string{"first", "mixed-in"}, tags())
+
+	// An inbound that fails to start is not added. The inbound it was to
+	// replace is not brought back from what it was created from, which could
+	// let removed users back in: it stays closed, and the caller restores it.
 	busy, err := net.Listen("tcp", ":"+F.ToString(inboundManagerBusyPort))
 	require.NoError(t, err)
 	defer busy.Close()
@@ -87,11 +110,14 @@ func TestInboundManagerUpdate(t *testing.T) {
 	require.Error(t, create(other))
 	_, loaded = manager.Get("other")
 	require.False(t, loaded)
+	require.Equal(t, []string{"first", "mixed-in"}, tags())
 	require.Error(t, create(mixedInbound(inboundManagerBusyPort)))
-	stillCurrent, loaded := manager.Get("mixed-in")
-	require.True(t, loaded)
-	require.Same(t, current, stillCurrent)
-	require.Len(t, manager.Inbounds(), 1)
+	_, loaded = manager.Get("mixed-in")
+	require.False(t, loaded)
+	requireNotListening(t, inboundManagerPortB)
+	require.Equal(t, []string{"first"}, tags())
+	testTCP(t, inboundManagerPortA, updateTestPort)
+	require.NoError(t, create(mixedInbound(inboundManagerPortB)))
 	testTCP(t, inboundManagerPortB, updateTestPort)
 
 	// Close closes every inbound and can be repeated.

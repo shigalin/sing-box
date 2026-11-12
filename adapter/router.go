@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -15,6 +16,15 @@ import (
 
 	"go4.org/netipx"
 )
+
+// ErrRestartRequired is the cause of the error UpdateRules returns for rules
+// that can only be applied by restarting the instance.
+var ErrRestartRequired = errors.New("restart required")
+
+// ErrRuleRequirementUnavailable is the cause of the error UpdateRules returns
+// for rules that need something the instance tried and failed to set up at
+// start, so that a restart would not make them match either.
+var ErrRuleRequirementUnavailable = errors.New("not available on this instance")
 
 type Router interface {
 	Lifecycle

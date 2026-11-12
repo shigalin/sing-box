@@ -47,9 +47,13 @@ type RemoteRuleSet struct {
 	access         sync.RWMutex
 	rules          []adapter.HeadlessRule
 	metadata       adapter.RuleSetMetadata
+	// updateAccess serializes fetches and guards lastUpdated and lastEtag:
+	// after UpdateRules a reused rule-set can briefly be driven by both the
+	// retiring updater and its replacement.
+	updateAccess   sync.Mutex
 	lastUpdated    time.Time
 	lastEtag       string
-	cacheFile      adapter.CacheFile
+	cacheFile     adapter.CacheFile
 	pauseManager   pause.Manager
 	callbacks      list.List[adapter.RuleSetUpdateCallback]
 	refs           atomic.Int32
@@ -224,7 +228,15 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	return nil
 }
 
+func (s *RemoteRuleSet) nextUpdate() time.Time {
+	s.updateAccess.Lock()
+	defer s.updateAccess.Unlock()
+	return s.lastUpdated.Add(s.updateInterval)
+}
+
 func (s *RemoteRuleSet) updateOnce() {
+	s.updateAccess.Lock()
+	defer s.updateAccess.Unlock()
 	err := s.fetch(s.ctx, false)
 	if err != nil {
 		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
