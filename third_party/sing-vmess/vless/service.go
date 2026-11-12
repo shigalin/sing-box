@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common/auth"
@@ -19,6 +20,7 @@ import (
 )
 
 type Service[T comparable] struct {
+	access   sync.RWMutex
 	userMap  map[[16]byte]T
 	userFlow map[T]string
 	logger   logger.Logger
@@ -48,8 +50,10 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 		userMap[userID] = userName
 		userFlowMap[userName] = userFlowList[i]
 	}
+	s.access.Lock()
 	s.userMap = userMap
 	s.userFlow = userFlowMap
+	s.access.Unlock()
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -57,12 +61,16 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	if err != nil {
 		return err
 	}
-	user, loaded := s.userMap[request.UUID]
+	// Published maps are immutable. Snapshot them together.
+	s.access.RLock()
+	userMap, userFlowMap := s.userMap, s.userFlow
+	s.access.RUnlock()
+	user, loaded := userMap[request.UUID]
 	if !loaded {
 		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
 	}
 	ctx = auth.ContextWithUser(ctx, user)
-	userFlow := s.userFlow[user]
+	userFlow := userFlowMap[user]
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")
 	} else if request.Flow != userFlow {

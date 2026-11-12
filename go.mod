@@ -201,3 +201,5 @@ require (
 )
 
 replace github.com/sagernet/sing-vmess => ./third_party/sing-vmess
+
+replace github.com/sagernet/sing-quic => ./third_party/sing-quic
