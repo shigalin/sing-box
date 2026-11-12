@@ -172,6 +172,9 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
 			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 			return
 		}
+		// Downstream may finish through onClose without closing this wrapper.
+		// Release its registration before notifying the parent callback.
+		onClose = N.AppendClose(onClose, func(error) { conn.Close() })
 	}
 	if userName != "" {
 		metadata.User = userName
