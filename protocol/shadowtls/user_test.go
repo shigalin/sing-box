@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -19,6 +20,8 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-shadowtls"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -115,4 +118,40 @@ func TestUserConnectionCompletionRacesWithRevocation(t *testing.T) {
 	remaining := len(h.conns)
 	h.connAccess.Unlock()
 	require.Zero(t, remaining)
+}
+
+// Revoke through the actual ShadowTLS registration boundary while the
+// downstream reader is consuming the first frame supplied by the service.
+func TestCachedFirstFrameReadRacesWithRevocation(t *testing.T) {
+	for iteration := 0; iteration < 64; iteration++ {
+		router := &completionRouter{}
+		h := &Inbound{Adapter: inbound.NewAdapter(C.TypeShadowTLS, "shadowtls-in"), router: router, logger: log.NewNOPFactory().NewLogger("test"), listener: listener.New(listener.Options{}), serviceConfig: &shadowtls.ServiceConfig{}, conns: make(map[*userConn]struct{})}
+		id := h.users.Update([]usertable.User{{Key: "alice", Name: "alice"}})[0]
+		raw, peer := net.Pipe()
+		(*inboundHandler)(h).NewConnectionEx(auth.ContextWithUser(context.Background(), strconv.Itoa(id)), bufio.NewCachedConn(raw, buf.As(make([]byte, 64*1024))), M.Socksaddr{}, M.Socksaddr{}, nil)
+		started := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			b := make([]byte, 1)
+			router.conn.Read(b)
+			close(started)
+			for {
+				if _, err := router.conn.Read(b); err != nil {
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+		<-started
+		h.users.Update(nil)
+		h.closeRemovedUsers()
+		peer.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("revocation failed to interrupt first-frame read")
+		}
+		require.Empty(t, h.conns)
+	}
 }

@@ -18,8 +18,10 @@ type _SnellInboundOptions struct {
 
 type AbstractSnellInboundOptions struct {
 	ListenOptions
-	PSK   string      `json:"psk"`
-	Users []SnellUser `json:"users,omitempty"`
+	PSK        string      `json:"psk,omitempty"`
+	UserPSK    bool        `json:"user_psk,omitempty"`
+	AuthDetour string      `json:"auth_detour,omitempty"`
+	Users      []SnellUser `json:"users,omitempty"`
 }
 
 type SnellInboundOptions _SnellInboundOptions
@@ -134,7 +136,8 @@ type SnellObfsServerOptions struct {
 
 type SnellUser struct {
 	Name    string `json:"name,omitempty"`
-	UserKey string `json:"userkey"`
+	UserKey string `json:"userkey,omitempty"`
+	PSK     string `json:"psk,omitempty"`
 }
 
 type SnellObfsClientOptions struct {

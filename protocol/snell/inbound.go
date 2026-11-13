@@ -41,6 +41,7 @@ type Inbound struct {
 	userService  userService
 	users        usertable.Table
 	updateAccess sync.Mutex
+	psk          *pskState
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
@@ -50,55 +51,66 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:  logger,
 	}
 	var err error
-	switch options.Version {
-	case 5:
-		var obfsMode snellprotocol.ObfsMode
-		obfsMode, err = snellprotocol.ParseObfsMode(options.ObfsOptions.ObfsMode)
-		if err != nil {
-			return nil, err
+	if options.UserPSK {
+		inbound.psk = &pskState{options: options, entries: make(map[string]*pskEntry), conns: make(map[*pskConn]*pskEntry), probeSlots: make(chan struct{}, 16)}
+		inbound.psk.options.Users = nil
+		if options.PSK != "" {
+			return nil, E.New("snell: user_psk cannot use a shared psk")
 		}
-		serviceOptions := snellv5.ServiceOptions{
-			PSK:      []byte(options.PSK),
-			ObfsMode: obfsMode,
-			Handler:  inbound,
-		}
-		if len(options.Users) > 0 {
-			var service *snellv5.MultiService[int]
-			service, err = snellv5.NewMultiService[int](serviceOptions)
+		err = inbound.updatePSKUsers(options.Users)
+	} else if options.AuthDetour != "" {
+		return nil, E.New("snell: auth_detour requires user_psk")
+	} else {
+		switch options.Version {
+		case 5:
+			var obfsMode snellprotocol.ObfsMode
+			obfsMode, err = snellprotocol.ParseObfsMode(options.ObfsOptions.ObfsMode)
 			if err != nil {
 				return nil, err
 			}
-			inbound.service = service
-			inbound.userService = service
-		} else {
-			inbound.service, err = snellv5.NewService(serviceOptions)
-		}
-	case 6:
-		var mode snellv6.Mode
-		mode, err = snellv6.ParseMode(options.V6Options.Mode)
-		if err != nil {
-			return nil, err
-		}
-		serviceOptions := snellv6.ServerOptions{
-			PSK:     []byte(options.PSK),
-			Mode:    mode,
-			Handler: inbound,
-		}
-		if len(options.Users) > 0 {
-			var service *snellv6.MultiService[int]
-			service, err = snellv6.NewMultiService[int](serviceOptions)
+			serviceOptions := snellv5.ServiceOptions{
+				PSK:      []byte(options.PSK),
+				ObfsMode: obfsMode,
+				Handler:  inbound,
+			}
+			if len(options.Users) > 0 {
+				var service *snellv5.MultiService[int]
+				service, err = snellv5.NewMultiService[int](serviceOptions)
+				if err != nil {
+					return nil, err
+				}
+				inbound.service = service
+				inbound.userService = service
+			} else {
+				inbound.service, err = snellv5.NewService(serviceOptions)
+			}
+		case 6:
+			var mode snellv6.Mode
+			mode, err = snellv6.ParseMode(options.V6Options.Mode)
 			if err != nil {
 				return nil, err
 			}
-			inbound.service = service
-			inbound.userService = service
-		} else {
-			inbound.service, err = snellv6.NewService(serviceOptions)
+			serviceOptions := snellv6.ServerOptions{
+				PSK:     []byte(options.PSK),
+				Mode:    mode,
+				Handler: inbound,
+			}
+			if len(options.Users) > 0 {
+				var service *snellv6.MultiService[int]
+				service, err = snellv6.NewMultiService[int](serviceOptions)
+				if err != nil {
+					return nil, err
+				}
+				inbound.service = service
+				inbound.userService = service
+			} else {
+				inbound.service, err = snellv6.NewService(serviceOptions)
+			}
+		case 0:
+			return nil, E.New("snell: missing version")
+		default:
+			return nil, E.New("snell: unsupported version: ", options.Version)
 		}
-	case 0:
-		return nil, E.New("snell: missing version")
-	default:
-		return nil, E.New("snell: unsupported version: ", options.Version)
 	}
 	if err != nil {
 		return nil, err
@@ -123,6 +135,12 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	if h.psk != nil {
+		scope.Add(h.closePSKConnections)
+		if h.psk.options.AuthDetour != "" {
+			return nil
+		}
+	}
 	err := h.listener.Start()
 	if err != nil {
 		return err
@@ -132,6 +150,10 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.psk != nil {
+		h.newPSKConnection(ctx, conn, metadata, onClose)
+		return
+	}
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -166,6 +188,17 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 }
 
 func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.psk != nil {
+		entry, _ := ctx.Value(pskContextKey{}).(*pskEntry)
+		h.psk.access.RLock()
+		valid := entry != nil && h.psk.entries[entry.name] == entry
+		h.psk.access.RUnlock()
+		if !valid {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
+			return
+		}
+		metadata.User = entry.name
+	}
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
 	if h.userService != nil {
@@ -193,6 +226,17 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 }
 
 func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.psk != nil {
+		entry, _ := ctx.Value(pskContextKey{}).(*pskEntry)
+		h.psk.access.RLock()
+		valid := entry != nil && h.psk.entries[entry.name] == entry
+		h.psk.access.RUnlock()
+		if !valid {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrPermission)
+			return
+		}
+		metadata.User = entry.name
+	}
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
 	// The snell client in Surge rejects UDP responses with domain addresses.

@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/prefixconn"
 	"github.com/sagernet/sing-box/common/usertable"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -150,6 +151,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 type inboundHandler Inbound
 
 func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	conn = prefixconn.TakeCached(conn)
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()

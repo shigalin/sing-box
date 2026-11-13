@@ -34,6 +34,10 @@ const (
 	nonReusableEOFMessage = "end of file"
 )
 
+// ReplayCache can be shared by services on one listener. Entries are derived
+// cipher keys, so equal salts under different PSKs do not collide.
+type ReplayCache = saltReplayCache
+
 type saltReplayCache struct {
 	access  sync.Mutex
 	current int
@@ -135,13 +139,14 @@ type Service struct {
 	psk       []byte
 	obfs      snell.ObfsConfig
 	handler   snell.Handler
-	saltCache saltReplayCache
+	saltCache *saltReplayCache
 }
 
 type ServiceOptions struct {
-	PSK      []byte
-	ObfsMode snell.ObfsMode
-	Handler  snell.Handler
+	ReplayCache *ReplayCache
+	PSK         []byte
+	ObfsMode    snell.ObfsMode
+	Handler     snell.Handler
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -154,10 +159,15 @@ func NewService(options ServiceOptions) (*Service, error) {
 	default:
 		return nil, E.New("snell: unknown obfs mode: ", int(options.ObfsMode))
 	}
+	cache := options.ReplayCache
+	if cache == nil {
+		cache = &ReplayCache{}
+	}
 	return &Service{
-		psk:     options.PSK,
-		obfs:    snell.ObfsConfig{Mode: options.ObfsMode},
-		handler: options.Handler,
+		saltCache: cache,
+		psk:       options.PSK,
+		obfs:      snell.ObfsConfig{Mode: options.ObfsMode},
+		handler:   options.Handler,
 	}, nil
 }
 
@@ -283,7 +293,7 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	// snell-server v5.0.1: initial request path: checks the first record salt after decryption
 	// and aborts with "Duplicated salt detected" when it was recently seen.
-	if s.saltCache.CheckAndAdd(salt) {
+	if s.saltCache.CheckAndAdd(key) {
 		record.Release()
 		return errDuplicateSalt
 	}
@@ -357,7 +367,7 @@ func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, sour
 	}
 	// snell-server v5.0.1: initial request path: checks the first record salt after decryption
 	// and aborts with "Duplicated salt detected" when it was recently seen.
-	if s.saltCache.CheckAndAdd(salt) {
+	if s.saltCache.CheckAndAdd(key) {
 		record.Release()
 		return errDuplicateSalt
 	}

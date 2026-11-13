@@ -94,3 +94,25 @@ HTTP obfuscation mode, one of `none` `http`.
 Traffic shaping mode, one of `default` `unshaped` `unsafe-raw`.
 
 `default` is used by default.
+
+### Independent PSKs (fork extension)
+
+Set `user_psk: true`, omit the shared `psk`, and provide users as
+`{"name": "user-id", "psk": "user-specific-secret"}` without `userkey`.
+Names and PSKs must be unique. Empty user updates reject all clients.
+Both v5 and v6 encrypted modes are supported; `unsafe-raw` is rejected.
+The client sends ordinary Snell wire data, so an unmodified mihomo works.
+
+Optionally set `auth_detour` to a ShadowTLS inbound tag. In this mode the
+Snell inbound opens no socket and accepts only connections forwarded from
+that ShadowTLS v3 inbound, whose gateway user must have a non-empty name.
+The gateway can use one shared password; it does not
+select the Snell identity. The inner PSK is always verified and selects the
+user for routing and accounting. Without `auth_detour`, normal listen fields
+apply and PSKs are identified on the public listener.
+
+User updates preserve services and sessions of unchanged users. Removed or
+rekeyed users' transports are closed, including reused TCP and UDP tunnels.
+Selection uses bounded authenticated-header probing with a 15-second deadline
+and a maximum of 16 pending lookups per inbound. Lookup cost grows linearly
+with the active user count; this extension is not a constant-time user lookup.

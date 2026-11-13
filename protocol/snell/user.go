@@ -18,6 +18,9 @@ type userService interface {
 // cannot take users, while an empty update of one created with users keeps
 // authentication on and rejects every user.
 func (h *Inbound) UpdateUsers(users []option.SnellUser) error {
+	if h.psk != nil {
+		return h.updatePSKUsers(users)
+	}
 	if h.userService == nil {
 		return E.New("snell: inbound was created without users")
 	}
