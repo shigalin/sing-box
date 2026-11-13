@@ -113,6 +113,47 @@ apply and PSKs are identified on the public listener.
 
 User updates preserve services and sessions of unchanged users. Removed or
 rekeyed users' transports are closed, including reused TCP and UDP tunnels.
-Selection uses bounded authenticated-header probing with a 15-second deadline
-and a maximum of 16 pending lookups per inbound. Lookup cost grows linearly
-with the active user count; this extension is not a constant-time user lookup.
+Selection uses bounded authenticated-header probing. One 15-second deadline
+covers the header and the first request: a connection stays pending, and its
+source is not remembered, until the selected user's service has decrypted and
+validated that request. A header that matches but is not followed by a valid
+request in time is closed and returns its capacity.
+At most 16 fallback candidate groups are checked concurrently per inbound;
+connections wait for a slot only after data arrives. A slot is held for at most
+256 candidates of one header size and then offered to the next waiting source,
+so the wait for a turn does not grow with the user count; a lookup that already
+started resumes ahead of new lookups from its own source and is not closed
+because the queue filled up meanwhile. Source hints (up to four
+users per source, 4096 addresses) are still verified cryptographically on every
+connection and are checked outside those slots when enough header bytes exist.
+Authentication admission also bounds pending connections and queued lookups
+globally and per source. Cold lookups have a separate global budget, and
+source-level token budgets limit repeated failed probes.
+Fallback and hint verification have separate global token, concurrency and
+queue budgets, so remembered sources cannot bypass admission entirely and a
+full fallback queue does not close a connection whose hinted user can still
+match. One source may use every free slot. While lookups wait, each freed slot
+goes to the next waiting source in turn and to that source's oldest waiting
+lookup, and a small share of the pending and queue capacity is kept for other
+sources. Excess pending or queued handshakes are closed; rate-limited lookups
+wait for capacity. Source limits use bursts to accommodate users behind a
+shared address. If the bounded per-source accounting table is full, new sources
+share the global budgets and one turn; they are not rejected solely because the
+table is full. Sessions whose first request was accepted are not subject to
+these handshake limits.
+
+Hinted and fallback candidates advance independently. While a connection is
+waiting for a slot, an incomplete header may be read by one bounded read-ahead
+operation. This allows a fragmented v6 default header to match its hint even
+when slots stay busy, and a complete longer header to match while a shorter
+hinted candidate waits for its budget. An available slot can still verify a
+shorter candidate immediately: it never waits for bytes required only by a
+longer hint. If that shorter candidate wins, its protocol inherits the pending
+read and all preread bytes in order. Closing or timing out lookup closes the
+transport to interrupt any pending read. No polling intervals are introduced.
+
+Hints reduce work when they match; they are not an admission guarantee or a
+limit on total CPU use. Before enough bytes for a hint arrive, available slots
+may check shorter candidates. Cold or wrong-PSK lookups remain linear in the
+active user count. Connection reuse and deployment-specific capacity testing
+remain important.

@@ -302,6 +302,7 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, source M.Soc
 		record.Release()
 		return E.Cause(err, "decode request")
 	}
+	snell.RequestAccepted(ctx)
 
 	switch request.Command {
 	case snell.CommandConnect:

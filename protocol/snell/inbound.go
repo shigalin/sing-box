@@ -3,6 +3,7 @@ package snell
 import (
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 
@@ -52,7 +53,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	var err error
 	if options.UserPSK {
-		inbound.psk = &pskState{options: options, entries: make(map[string]*pskEntry), conns: make(map[*pskConn]*pskEntry), probeSlots: make(chan struct{}, 16)}
+		inbound.psk = &pskState{options: options, entries: make(map[string]*pskEntry), conns: make(map[*pskConn]*pskEntry), hints: make(map[netip.Addr][]*pskEntry), done: make(chan struct{}), timeout: C.TCPTimeout}
+		inbound.psk.admission = newPSKAdmission()
 		inbound.psk.options.Users = nil
 		if options.PSK != "" {
 			return nil, E.New("snell: user_psk cannot use a shared psk")

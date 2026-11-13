@@ -9,3 +9,9 @@ unsafe-raw cannot probe PSKs. v5 ServiceOptions can share a ReplayCache across
 per-user services. It records derived cipher keys rather than raw salts, so
 replays remain rejected without allocating a Bloom filter pair per user or
 rejecting an equal salt used with another PSK.
+
+The v5/v6 single-PSK Service calls snell.RequestAccepted once it has decrypted
+and validated the first request (after the v5 replay check), before handling
+it. A caller that picked the service from a header prefix registers a function
+with snell.ContextWithRequestAccepted to keep its handshake deadline and
+admission accounting until then; without one the call does nothing.
