@@ -694,6 +694,14 @@ type packetVectorisedWriter struct {
 }
 
 func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	// Validate the whole batch before advancing any nonces. Otherwise a
+	// rejected suffix discards encrypted records that the peer never saw.
+	for _, buffer := range buffers {
+		if buffer.Len() > maxPayload {
+			buf.ReleaseMulti(buffers)
+			return snell.ErrPayloadTooLarge
+		}
+	}
 	var records []*buf.Buffer
 	defer func() {
 		buf.ReleaseMulti(records)
@@ -717,11 +725,6 @@ func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			panic("snell: invalid v4 payload limit")
 		}
 		dataLen := buffer.Len()
-		if dataLen > payloadLimit {
-			buffer.Release()
-			buf.ReleaseMulti(buffers[index+1:])
-			return snell.ErrPayloadTooLarge
-		}
 		recordWriter.advancePayloadLimit(payloadLimit, nowUnix)
 		paddingLen := recordWriter.framePaddingLen(dataLen)
 		record, err := recordWriter.makeBufferRecordLocked(buffer, paddingLen)
@@ -754,7 +757,9 @@ func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
 	if payloadLimit <= 0 || payloadLimit > maxPayload {
 		panic("snell: invalid v4 payload limit")
 	}
-	if dataLen > payloadLimit {
+	// A datagram occupies one record; the stream shaping window is not
+	// a packet-size limit. Keep the wire-format payload bound.
+	if dataLen > maxPayload {
 		return snell.ErrPayloadTooLarge
 	}
 	w.advancePayloadLimit(payloadLimit, nowUnix)

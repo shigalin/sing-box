@@ -813,6 +813,9 @@ func (r *Router) actionSniff(
 		} else {
 			packetSniffers = defaultPacketSniffers
 		}
+		// Packet connections with a larger read MTU may have cached a full
+		// first datagram. Keep that datagram intact when sniffing and replaying it.
+		sniffBufferSize := max(buf.UDPBufferSize, N.CalculateMTU(inputPacketConn, nil))
 		var err error
 		for _, packetBuffer := range inputPacketBuffers {
 			if quicMoreData() {
@@ -840,7 +843,7 @@ func (r *Router) actionSniff(
 		}
 		for {
 			var (
-				sniffBuffer = buf.NewPacket()
+				sniffBuffer = buf.NewSize(sniffBufferSize)
 				destination M.Socksaddr
 				done        = make(chan struct{})
 			)

@@ -64,4 +64,8 @@ jobs:
       - name: Race-test authentication and QUIC integration
         if: matrix.os == 'ubuntu-latest'
         working-directory: test
-        run: go test -mod=readonly -race -count=1 -tags with_quic -timeout 5m -run '^(TestQUICConcurrentUserUpdate|TestVLESSUpdateUsers|TestVMessUpdateUsers|TestSnellUpdateUsers|TestSnellUpdateUsersReuse|TestSnellV6UpdateUsers|TestSnellV6UpdateUsersReuse|TestShadowTLSUpdateUsers|TestShadowTLSUpdateUsersReuse|TestShadowTLSSnellV6UpdateUsers|TestShadowTLSSnellV6UpdateUsersReuse|TestHysteriaSelf|TestHysteria2Self|TestTUICSelf)$' .
+        run: go test -mod=readonly -race -count=1 -tags with_quic -timeout 5m -run '^(TestQUICConcurrentUserUpdate|TestVLESSUpdateUsers|TestVMessUpdateUsers|TestSnellLargeUDP|TestSnellV[56]UDPResponseBoundary|TestSnellV5UDPConnectResponseBoundary|TestSnellUpdateUsers|TestSnellUpdateUsersReuse|TestSnellV6UpdateUsers|TestSnellV6UpdateUsersReuse|TestShadowTLSUpdateUsers|TestShadowTLSUpdateUsersReuse|TestShadowTLSSnellV6UpdateUsers|TestShadowTLSSnellV6UpdateUsersReuse|TestHysteriaSelf|TestHysteria2Self|TestTUICSelf)$' .
+      - name: Race-test Snell UDP with low memory
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: test
+        run: go test -mod=readonly -race -count=1 -tags 'with_quic with_low_memory' -timeout 2m -run '^TestSnellV[56]LargeFirstUDP$' .

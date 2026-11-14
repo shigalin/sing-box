@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	maxUDPResponseHeaderLen = 1 + 16 + 2
-	minUDPPayloadLimit      = framePayloadStep
+	ipv4UDPResponseHeaderLen = 1 + 4 + 2
+	maxUDPResponseHeaderLen  = 1 + 16 + 2
 )
 
 type serverPacketConn struct {
@@ -35,9 +35,9 @@ type serverPacketConn struct {
 
 func (c *serverPacketConn) responseAddrLen(source M.Socksaddr) int {
 	if source.Unwrap().Addr.Is4() {
-		return 1 + 4 + 2
+		return ipv4UDPResponseHeaderLen
 	}
-	return 1 + 16 + 2
+	return maxUDPResponseHeaderLen
 }
 
 func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
@@ -244,8 +244,15 @@ func (c *serverPacketConn) RearHeadroom() int {
 	return snell.AEADTagLen
 }
 
+func (c *serverPacketConn) ReaderMTU() int {
+	return maxPayload
+}
+
 func (c *serverPacketConn) WriterMTU() int {
-	return minUDPPayloadLimit - maxUDPResponseHeaderLen
+	// Leave one byte beyond the largest legal UDP response. Any packet
+	// truncated at this capacity is still too large to encode, even with
+	// the shortest address header.
+	return maxPayload - ipv4UDPResponseHeaderLen + 1
 }
 
 func (c *serverPacketConn) Upstream() any {

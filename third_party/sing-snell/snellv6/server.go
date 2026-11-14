@@ -206,10 +206,8 @@ func (s *Service) newPacketConnection(ctx context.Context, packetConn *serverPac
 	if err != nil {
 		return err
 	}
-	firstPacket := buf.NewPacket()
-	destination, err := packetConn.ReadPacket(firstPacket)
+	firstPacket, destination, err := packetConn.WaitReadPacket()
 	if err != nil {
-		firstPacket.Release()
 		return E.Cause(err, "read first packet")
 	}
 	s.handler.NewPacketConnectionEx(ctx, bufio.NewCachedPacketConn(packetConn, firstPacket, destination), source, destination, onClose)

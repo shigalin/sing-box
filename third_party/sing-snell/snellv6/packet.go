@@ -19,6 +19,8 @@ import (
 const (
 	maxUDPRequestHeaderLen  = 1 + 1 + 255 + 2
 	maxUDPResponseHeaderLen = 1 + 16 + 2
+	// Read the entire socket datagram before checking its encoded record size.
+	udpReceiveCapacity = 65535
 )
 
 func (c *clientPacketConn) udpRequestAddrLen(destination M.Socksaddr) int {
@@ -206,7 +208,7 @@ func (c *clientPacketConn) RearHeadroom() int {
 }
 
 func (c *clientPacketConn) WriterMTU() int {
-	return maxPayload - maxUDPRequestHeaderLen
+	return udpReceiveCapacity
 }
 
 func (c *clientPacketConn) Upstream() any {
@@ -397,8 +399,12 @@ func (c *serverPacketConn) RearHeadroom() int {
 	return snell.AEADTagLen
 }
 
+func (c *serverPacketConn) ReaderMTU() int {
+	return maxPayload
+}
+
 func (c *serverPacketConn) WriterMTU() int {
-	return maxPayload - maxUDPResponseHeaderLen
+	return udpReceiveCapacity
 }
 
 func (c *serverPacketConn) Upstream() any {

@@ -16,10 +16,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-const (
-	maxUDPRequestHeaderLen = 1 + 1 + 255 + 2
-	minUDPPayloadLimit     = frameSize - resetRecordOverhead
-)
+const maxUDPRequestHeaderLen = 1 + 1 + 255 + 2
 
 type clientPacketConn struct {
 	net.Conn
@@ -216,7 +213,10 @@ func (c *clientPacketConn) RearHeadroom() int {
 }
 
 func (c *clientPacketConn) WriterMTU() int {
-	return minUDPPayloadLimit - maxUDPRequestHeaderLen
+	// The copy loop uses this value as its UDP receive capacity. Read the
+	// whole datagram, including oversized ones, so WritePacket can reject
+	// it using the actual address header instead of forwarding a prefix.
+	return 65535
 }
 
 func (c *clientPacketConn) Upstream() any {
