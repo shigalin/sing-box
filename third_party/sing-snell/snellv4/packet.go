@@ -212,6 +212,10 @@ func (c *clientPacketConn) RearHeadroom() int {
 	return snell.AEADTagLen
 }
 
+func (c *clientPacketConn) ReaderMTU() int {
+	return maxPayload
+}
+
 func (c *clientPacketConn) WriterMTU() int {
 	// The copy loop uses this value as its UDP receive capacity. Read the
 	// whole datagram, including oversized ones, so WritePacket can reject
@@ -267,6 +271,7 @@ var (
 	_ N.PacketConn              = (*clientPacketConn)(nil)
 	_ N.PacketReadWaiter        = (*clientPacketConn)(nil)
 	_ N.PacketBatchWriteCreator = (*clientPacketConn)(nil)
+	_ N.ReaderWithMTU           = (*clientPacketConn)(nil)
 	_ N.WriterWithMTU           = (*clientPacketConn)(nil)
 	_ N.PacketBatchWriter       = (*clientPacketBatchWriter)(nil)
 )

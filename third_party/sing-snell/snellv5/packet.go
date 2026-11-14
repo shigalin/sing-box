@@ -291,6 +291,7 @@ var (
 	_ N.PacketConn              = (*serverPacketConn)(nil)
 	_ N.PacketReadWaiter        = (*serverPacketConn)(nil)
 	_ N.PacketBatchWriteCreator = (*serverPacketConn)(nil)
+	_ N.ReaderWithMTU           = (*serverPacketConn)(nil)
 	_ N.WriterWithMTU           = (*serverPacketConn)(nil)
 	_ N.PacketBatchWriter       = (*serverPacketBatchWriter)(nil)
 )

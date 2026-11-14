@@ -37,3 +37,7 @@ rejection and recovery after a rejected batch. test/snell_udp_test.go covers
 bidirectional forwarding, shared/independent PSKs and reuse configuration
 on/off, IPv4/IPv6 response boundaries on Linux including v5 with udp_connect,
 and 8500-byte v5/v6 first datagrams with sniffing and UDP timeouts.
+
+The v4/v6 clients advertise ReaderMTU for UDP response reads through NAT
+wrappers, including route address overrides. Linux CI exercises these reads
+in standard and low-memory builds.

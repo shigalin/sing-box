@@ -207,6 +207,10 @@ func (c *clientPacketConn) RearHeadroom() int {
 	return snell.AEADTagLen
 }
 
+func (c *clientPacketConn) ReaderMTU() int {
+	return maxPayload
+}
+
 func (c *clientPacketConn) WriterMTU() int {
 	return udpReceiveCapacity
 }
@@ -443,11 +447,13 @@ var (
 	_ N.PacketConn              = (*clientPacketConn)(nil)
 	_ N.PacketReadWaiter        = (*clientPacketConn)(nil)
 	_ N.PacketBatchWriteCreator = (*clientPacketConn)(nil)
+	_ N.ReaderWithMTU           = (*clientPacketConn)(nil)
 	_ N.WriterWithMTU           = (*clientPacketConn)(nil)
 	_ N.PacketBatchWriter       = (*clientPacketBatchWriter)(nil)
 	_ N.PacketConn              = (*serverPacketConn)(nil)
 	_ N.PacketReadWaiter        = (*serverPacketConn)(nil)
 	_ N.PacketBatchWriteCreator = (*serverPacketConn)(nil)
+	_ N.ReaderWithMTU           = (*serverPacketConn)(nil)
 	_ N.WriterWithMTU           = (*serverPacketConn)(nil)
 	_ N.PacketBatchWriter       = (*serverPacketBatchWriter)(nil)
 )

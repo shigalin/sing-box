@@ -25,6 +25,15 @@ import (
 )
 
 func TestSnellLargeUDP(t *testing.T) {
+	testSnellLargeUDP(t, false)
+}
+
+func TestSnellNATLargeUDP(t *testing.T) {
+	testSnellLargeUDP(t, true)
+}
+
+func testSnellLargeUDP(t *testing.T, override bool) {
+	t.Helper()
 	for _, versions := range [][2]int{{5, 4}, {6, 6}} {
 		for _, userPSK := range []bool{false, true} {
 			for _, reuse := range []bool{false, true} {
@@ -61,7 +70,17 @@ func TestSnellLargeUDP(t *testing.T) {
 						Inbounds:  []option.Inbound{{Type: C.TypeSnell, Options: inbound}},
 						Outbounds: []option.Outbound{{Type: C.TypeDirect}},
 					})
+					destination := M.ParseSocksaddr(target.LocalAddr().String())
+					var route *option.RouteOptions
+					if override {
+						destination = M.ParseSocksaddrHostPort("127.0.0.2", destination.Port)
+						route = &option.RouteOptions{Rules: []option.Rule{snellUDPRouteRule(option.RuleAction{
+							Action:              C.RuleActionTypeRouteOptions,
+							RouteOptionsOptions: option.RouteOptionsActionOptions{OverrideAddress: "127.0.0.1"},
+						})}}
+					}
 					startInstance(t, option.Options{
+						Route:    route,
 						Inbounds: []option.Inbound{mixedInbound(clientPort)},
 						Outbounds: []option.Outbound{{
 							Type: C.TypeSnell,
@@ -74,7 +93,7 @@ func TestSnellLargeUDP(t *testing.T) {
 						}},
 					})
 					client := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
-					conn, err := client.ListenPacket(context.Background(), M.ParseSocksaddr(target.LocalAddr().String()))
+					conn, err := client.ListenPacket(context.Background(), destination)
 					require.NoError(t, err)
 					defer conn.Close()
 					// Start large: small warm-up packets must not hide a record growth limit.
@@ -89,7 +108,7 @@ func TestSnellLargeUDP(t *testing.T) {
 							payload[i] = byte(i*31 + size)
 						}
 						require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
-						_, err = conn.WriteTo(payload, target.LocalAddr())
+						_, err = conn.WriteTo(payload, destination.UDPAddr())
 						require.NoError(t, err, "send %d-byte datagram", size)
 						reply := make([]byte, 65535)
 						n, _, err := conn.ReadFrom(reply)
