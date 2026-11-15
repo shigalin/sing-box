@@ -10,6 +10,7 @@ import (
 	"time"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/internal/eof"
 	"github.com/sagernet/sing-snell/internal/reuse"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -25,9 +26,7 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 		if err != nil {
 			return nil, err
 		}
-		if snell.KeepSessionFromContext(ctx) {
-			session.keepOnce.Store(true)
-		}
+		session.keepOnce.Store(snell.KeepSessionFromContext(ctx))
 		conn, err := session.DialConn(destination)
 		if err != nil {
 			session.Close()
@@ -100,7 +99,8 @@ func (c *Client) Close() error {
 
 type reuseSession struct {
 	net.Conn
-	client *Client
+	transport *reuse.Conn
+	client    *Client
 
 	state    atomic.Uint32
 	keepOnce atomic.Bool
@@ -109,7 +109,8 @@ type reuseSession struct {
 }
 
 func (c *Client) newReuseSession(conn net.Conn) *reuseSession {
-	return &reuseSession{Conn: c.obfs.ClientConn(conn), client: c}
+	transport := &reuse.Conn{Conn: conn}
+	return &reuseSession{Conn: c.obfs.ClientConn(transport), transport: transport, client: c}
 }
 
 func (s *reuseSession) ReuseState() *atomic.Uint32 {
@@ -137,7 +138,7 @@ func (s *reuseSession) Release(reusable bool) {
 		s.Close()
 		return
 	}
-	if !s.state.CompareAndSwap(uint32(reuse.StateActive), uint32(reuse.StateReady)) {
+	if !s.transport.Ready(&s.state, reuse.StateActive) {
 		if reuse.State(s.state.Load()) != reuse.StateClosed {
 			s.Close()
 		}
@@ -154,10 +155,6 @@ func (s *reuseSession) Close() error {
 }
 
 func (s *reuseSession) startDrain() {
-	if s.closeIdle() {
-		s.Close()
-		return
-	}
 	if !s.state.CompareAndSwap(uint32(reuse.StateActive), uint32(reuse.StateWaiting)) {
 		if reuse.State(s.state.Load()) != reuse.StateClosed {
 			s.Close()
@@ -176,7 +173,7 @@ func (s *reuseSession) drain() {
 	for {
 		record, err := s.reader.NextRecord()
 		if errors.Is(err, io.EOF) {
-			s.state.CompareAndSwap(uint32(reuse.StateWaiting), uint32(reuse.StateReady))
+			s.transport.Ready(&s.state, reuse.StateWaiting)
 			return
 		}
 		if err != nil {
@@ -200,8 +197,9 @@ type reuseConn struct {
 	destination M.Socksaddr
 
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	writer          *writer
-	closeWriteOnce  sync.Once
+	writeClosed     bool
 	closeWriteErr   error
 	closeOnce       sync.Once
 	closeErr        error
@@ -217,7 +215,7 @@ func (c *reuseConn) readResponse() error {
 		return nil
 	}
 	if c.session.reader == nil {
-		c.session.reader = &reader{upstream: c.session.Conn, psk: c.session.client.psk}
+		c.session.reader = &reader{upstream: eof.UnexpectedReader{Reader: c.session.Conn}, psk: c.session.client.psk}
 		c.session.reader.InitializeReadWaiter(c.readWaitOptions)
 	}
 	record, err := c.session.reader.ReadRecord()
@@ -236,26 +234,35 @@ func (c *reuseConn) readResponse() error {
 }
 
 func (c *reuseConn) Read(p []byte) (int, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if c.closed.Load() {
 		return 0, net.ErrClosed
+	}
+	if c.readClosed.Load() {
+		return 0, io.EOF
 	}
 	c.readActionCount.Add(1)
 	defer c.readActionCount.Add(-1)
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	c.readAccess.Unlock()
 	err := c.readResponse()
+	c.readAccess.Lock()
 	if err != nil {
 		return 0, err
 	}
 	var discarded int
 	for {
+		c.readAccess.Unlock()
 		n, err := c.session.reader.Read(p)
+		c.readAccess.Lock()
 		if c.closed.Load() {
 			discarded += n
 			if errors.Is(err, io.EOF) {
 				c.readClosed.Store(true)
-				c.session.state.CompareAndSwap(uint32(reuse.StateWaiting), uint32(reuse.StateReady))
+				c.session.transport.Ready(&c.session.state, reuse.StateWaiting)
 				return 0, err
 			}
 			if err != nil {
@@ -276,28 +283,37 @@ func (c *reuseConn) Read(p []byte) (int, error) {
 }
 
 func (c *reuseConn) ReadBuffer(buffer *buf.Buffer) error {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if c.closed.Load() {
 		return net.ErrClosed
+	}
+	if c.readClosed.Load() {
+		return io.EOF
 	}
 	c.readActionCount.Add(1)
 	defer c.readActionCount.Add(-1)
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
+	c.readAccess.Unlock()
 	err := c.readResponse()
+	c.readAccess.Lock()
 	if err != nil {
 		return err
 	}
 	var discarded int
 	for {
 		bufferLen := buffer.Len()
+		c.readAccess.Unlock()
 		err = c.session.reader.ReadBuffer(buffer)
+		c.readAccess.Lock()
 		if c.closed.Load() {
 			discarded += buffer.Len() - bufferLen
 			buffer.Truncate(bufferLen)
 			if errors.Is(err, io.EOF) {
 				c.readClosed.Store(true)
-				c.session.state.CompareAndSwap(uint32(reuse.StateWaiting), uint32(reuse.StateReady))
+				c.session.transport.Ready(&c.session.state, reuse.StateWaiting)
 				return err
 			}
 			if err != nil {
@@ -369,15 +385,14 @@ func (c *reuseConn) writeRequestBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *reuseConn) Write(p []byte) (int, error) {
-	if c.writer != nil {
-		return c.writer.Write(p)
-	}
 	c.access.Lock()
+	defer c.access.Unlock()
+	if c.writeClosed || c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	if c.writer != nil {
-		c.access.Unlock()
 		return c.writer.Write(p)
 	}
-	defer c.access.Unlock()
 	err := c.writeRequest(p)
 	if err != nil {
 		return 0, err
@@ -386,15 +401,15 @@ func (c *reuseConn) Write(p []byte) (int, error) {
 }
 
 func (c *reuseConn) WriteBuffer(buffer *buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteBuffer(buffer)
-	}
 	c.access.Lock()
+	defer c.access.Unlock()
+	if c.writeClosed || c.closed.Load() {
+		buffer.Release()
+		return net.ErrClosed
+	}
 	if c.writer != nil {
-		c.access.Unlock()
 		return c.writer.WriteBuffer(buffer)
 	}
-	defer c.access.Unlock()
 	return c.writeRequestBuffer(buffer)
 }
 
@@ -413,11 +428,12 @@ type reuseVectorisedWriter struct {
 
 func (w *reuseVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
-	if conn.writer != nil {
-		return conn.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
-	}
 	conn.access.Lock()
 	defer conn.access.Unlock()
+	if conn.writeClosed || conn.closed.Load() {
+		buf.ReleaseMulti(buffers)
+		return net.ErrClosed
+	}
 	if conn.writer != nil {
 		return conn.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
 	}
@@ -440,34 +456,44 @@ func (w *reuseVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 }
 
 func (c *reuseConn) CloseWrite() error {
-	c.closeWriteOnce.Do(func() {
-		c.access.Lock()
-		defer c.access.Unlock()
-		if c.writer == nil {
-			c.closeWriteErr = c.writeRequest(nil)
-			if c.closeWriteErr != nil {
-				return
-			}
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.closeWriteLocked()
+}
+
+func (c *reuseConn) closeWriteLocked() error {
+	if c.writeClosed {
+		return c.closeWriteErr
+	}
+	c.writeClosed = true
+	if c.writer == nil {
+		c.closeWriteErr = c.writeRequest(nil)
+		if c.closeWriteErr != nil {
+			return c.closeWriteErr
 		}
-		c.closeWriteErr = c.writer.WriteZeroChunk()
-	})
+	}
+	c.closeWriteErr = c.writer.WriteZeroChunk()
 	return c.closeWriteErr
 }
 
 func (c *reuseConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		if !c.replyRead.Load() {
-			c.session.Release(false)
-			return
-		}
-		c.closeErr = c.CloseWrite()
-		if c.closeErr != nil {
+		if !c.replyRead.Load() || !c.access.TryLock() {
 			c.session.Release(false)
 			return
 		}
 		c.session.Conn.SetReadDeadline(time.Time{})
 		c.session.Conn.SetWriteDeadline(time.Time{})
+		c.closeErr = c.closeWriteLocked()
+		c.access.Unlock()
+		if c.closeErr != nil {
+			c.session.Release(false)
+			return
+		}
+		// Serialize reader completion with the decision to reuse or drain.
+		c.readAccess.Lock()
+		defer c.readAccess.Unlock()
 		if c.readClosed.Load() {
 			c.session.Release(true)
 			return
@@ -485,12 +511,7 @@ func (c *reuseConn) Close() error {
 				}
 				return
 			}
-			poolState := reuse.StateWaiting
-			if c.readClosed.Load() {
-				c.session.state.CompareAndSwap(uint32(reuse.StateWaiting), uint32(reuse.StateReady))
-				poolState = reuse.StateReady
-			}
-			if !c.session.client.pool.MoveToPool(c.session, poolState, false) {
+			if !c.session.client.pool.MoveToPool(c.session, reuse.StateWaiting, false) {
 				return
 			}
 			return
@@ -517,21 +538,30 @@ func (w *reuseReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needC
 }
 
 func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
+	w.conn.readAccess.Lock()
+	defer w.conn.readAccess.Unlock()
 	if w.conn.closed.Load() {
 		return nil, net.ErrClosed
+	}
+	if w.conn.readClosed.Load() {
+		return nil, io.EOF
 	}
 	w.conn.readActionCount.Add(1)
 	defer w.conn.readActionCount.Add(-1)
 	if w.conn.closed.Load() {
 		return nil, net.ErrClosed
 	}
+	w.conn.readAccess.Unlock()
 	err := w.conn.readResponse()
+	w.conn.readAccess.Lock()
 	if err != nil {
 		return nil, err
 	}
 	var discarded int
 	for {
+		w.conn.readAccess.Unlock()
 		buffer, err := w.conn.session.reader.WaitReadBuffer()
+		w.conn.readAccess.Lock()
 		if w.conn.closed.Load() {
 			if buffer != nil {
 				discarded += buffer.Len()
@@ -539,7 +569,7 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 			}
 			if errors.Is(err, io.EOF) {
 				w.conn.readClosed.Store(true)
-				w.conn.session.state.CompareAndSwap(uint32(reuse.StateWaiting), uint32(reuse.StateReady))
+				w.conn.session.transport.Ready(&w.conn.session.state, reuse.StateWaiting)
 				return nil, err
 			}
 			if err != nil {
@@ -560,6 +590,8 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 }
 
 func (c *reuseConn) FrontHeadroom() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if c.writer != nil {
 		return c.writer.FrontHeadroom()
 	}
@@ -580,6 +612,8 @@ func (c *reuseConn) NeedHandshakeForRead() bool {
 }
 
 func (c *reuseConn) NeedHandshakeForWrite() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return c.writer == nil
 }
 

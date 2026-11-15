@@ -23,8 +23,9 @@ keeps connected UDP batch buffers in the 32 KiB pool class.
 Packets are checked against the wire payload bound (0x3fff for
 v4/v5 and 0xffff for v6) after adding their actual address header. This
 preserves valid datagrams and rejects oversized datagrams before a truncated
-prefix can be forwarded. Vectorised writers preflight the entire batch before
-changing cipher state, so a rejected suffix cannot break a later valid write.
+prefix can be forwarded. Record writers preflight their input before changing
+cipher state. The v5/v6 server batch writers filter invalid responses before
+passing the remaining datagrams to the record writers.
 
 The v5/v6 servers pass the first UDP datagram from WaitReadPacket directly to
 the routing layer. They advertise a ReaderMTU so routing can size its sniffing
@@ -41,3 +42,39 @@ and 8500-byte v5/v6 first datagrams with sniffing and UDP timeouts.
 The v4/v6 clients advertise ReaderMTU for UDP response reads through NAT
 wrappers, including route address overrides. Linux CI exercises these reads
 in standard and low-memory builds.
+
+The v5/v6 server paths incorporate the upstream EOF, reuse session lifecycle,
+and dial error fixes through 7cb6221. They also incorporate the server response
+behavior from 6055ff1 and 04667b0: discard non-IP responses and use EMSGSIZE for
+oversized responses so forwarding can continue on the same tunnel.
+
+The v4/v6 client paths also incorporate the matching upstream fixes:
+35f4c8b distinguishes transport EOF from a protocol zero chunk, including v4
+record payload/padding truncation; ff8534e and 543d2cb probe idle pooled sockets
+and select ready sessions in LIFO order. The idle wrapper also preserves a
+pending probe across empty reads and finishes the old watch's state transition
+before handing its byte to the next logical connection. The reuse writer
+synchronization, write-after-CloseWrite rejection, sticky read EOF and deadline
+reset fixes from 5f17be4, 7077fca, 4c925cc and 52e3444 are retained alongside
+the local MTU changes. The v4 empty Write fix from 72a9d48 makes empty writes
+no-ops rather than sending a protocol EOF. Client packet batches incorporate
+04667b0: discard only oversized datagrams and still send valid datagrams from
+the same batch.
+
+The v5/v6 server completion path converges through Close's single owner.
+After successful completion, Close waits for the final response EOF instead
+of interpreting contention with CloseWrite as a blocked write and aborting the
+tunnel. Before successful completion, Close still interrupts blocked writes.
+Regression tests exercise concurrent completion/close and interrupted writes;
+v6 response batch tests cover all three modes and IPv4/IPv6 boundaries.
+
+Dial error replies match native platform socket errors, using Winsock WSAE*
+codes on Windows rather than Go's synthetic POSIX errno constants.
+
+Local follow-up regressions cover data returned together with transport EOF,
+server metadata reads concurrent with response initialization, and request read
+failures after the response has half-closed. The server rejects failed request
+streams instead of draining them, while healthy upload drains still permit the
+next request. Client read completion and Close share a lock for the pool handoff,
+without holding it during transport reads. Non-reusable connection writer
+publication and shaped-writer headroom reads are synchronized as well.

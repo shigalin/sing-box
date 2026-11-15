@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/internal/eof"
 	"github.com/sagernet/sing-snell/internal/reuse"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -28,6 +29,7 @@ type serverReuseSession[U comparable] struct {
 	net.Conn
 	service      *Service
 	multiService *MultiService[U]
+	transport    *eof.TrackingReader
 	reader       reuse.RecordReader
 	writer       reuse.RecordWriter
 }
@@ -104,7 +106,7 @@ func (s *serverReuseSession[U]) Serve(ctx context.Context, source M.Socksaddr, o
 			s.Conn.Close()
 			return requestCtx.Err()
 		}
-		err = serverConn.CloseWrite()
+		err = serverConn.Close()
 		if err != nil {
 			s.Conn.Close()
 			return err
@@ -133,6 +135,9 @@ func (s *serverReuseSession[U]) Serve(ctx context.Context, source M.Socksaddr, o
 					return E.New("snell: read too much data after request end")
 				}
 			}
+			if s.transport.Reached() {
+				err = eof.Unexpected(err)
+			}
 			if !errors.Is(err, io.EOF) {
 				s.Conn.Close()
 				return E.Cause(err, "drain request")
@@ -140,10 +145,10 @@ func (s *serverReuseSession[U]) Serve(ctx context.Context, source M.Socksaddr, o
 		}
 		record, err = s.reader.ReadRecord()
 		if err != nil {
+			s.Conn.Close()
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			s.Conn.Close()
 			return E.Cause(err, "read request")
 		}
 		request, err = s.service.readRequest(record)
@@ -159,17 +164,18 @@ type serverReuseConn[U comparable] struct {
 	net.Conn
 	session *serverReuseSession[U]
 
-	access         sync.Mutex
-	closeWriteOnce sync.Once
-	closeWriteErr  error
-	closeOnce      sync.Once
-	closeErr       error
-	readClosed     atomic.Bool
-	aborted        atomic.Bool
-	replyWritten   bool
-	writeClosed    bool
-	completeOnce   sync.Once
-	completion     chan struct{}
+	access        sync.Mutex
+	closeWriteErr error
+	closeOnce     sync.Once
+	closeErr      error
+	readClosed    atomic.Bool
+	readFailed    atomic.Bool
+	aborted       atomic.Bool
+	replyWritten  bool
+	writeClosed   bool
+	completeOnce  sync.Once
+	completion    chan struct{}
+	completeErr   error
 }
 
 func (c *serverReuseConn[U]) writeFirstResponse(payload []byte) error {
@@ -296,18 +302,33 @@ func (c *serverReuseConn[U]) writeErrorResponse(code byte, messageText string) e
 }
 
 func (c *serverReuseConn[U]) Read(p []byte) (int, error) {
-	n, err := c.session.reader.Read(p)
-	if errors.Is(err, io.EOF) {
-		c.readClosed.Store(true)
+	if c.readClosed.Load() {
+		return 0, io.EOF
 	}
-	return n, err
+	n, err := c.session.reader.Read(p)
+	return n, c.readError(err)
 }
 
 func (c *serverReuseConn[U]) ReadBuffer(buffer *buf.Buffer) error {
-	err := c.session.reader.ReadBuffer(buffer)
-	if errors.Is(err, io.EOF) {
-		c.readClosed.Store(true)
+	if c.readClosed.Load() {
+		return io.EOF
 	}
+	return c.readError(c.session.reader.ReadBuffer(buffer))
+}
+
+func (c *serverReuseConn[U]) readError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, io.EOF) {
+		c.readFailed.Store(true)
+		return err
+	}
+	if c.session.transport.Reached() {
+		c.readFailed.Store(true)
+		return io.ErrUnexpectedEOF
+	}
+	c.readClosed.Store(true)
 	return err
 }
 
@@ -383,36 +404,90 @@ func (w *serverReuseVectorisedWriter[U]) WriteVectorised(buffers []*buf.Buffer) 
 }
 
 func (c *serverReuseConn[U]) CloseWrite() error {
-	c.closeWriteOnce.Do(func() {
-		c.access.Lock()
-		defer c.access.Unlock()
-		c.writeClosed = true
-		// snell-server v5.0.1: FUN_0013f020 reports upstream EOF before any
-		// payload as ReplyError 0x65 "Remote EOF", then aborts the reusable tunnel.
-		if !c.replyWritten {
-			c.closeWriteErr = c.writeErrorResponse(remoteEOFCode, remoteEOFMessage)
-			if c.closeWriteErr == nil {
-				c.aborted.Store(true)
-				c.closeWriteErr = c.session.Conn.Close()
-			}
-			return
-		}
-		c.closeWriteErr = c.session.writer.WriteZeroChunk()
-	})
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.closeWriteLocked()
+}
+
+func (c *serverReuseConn[U]) closeWriteLocked() error {
+	if c.writeClosed {
+		return c.closeWriteErr
+	}
+	// snell-server v5.0.1: FUN_0013f020 reports upstream EOF before any
+	// payload as ReplyError 0x65 "Remote EOF", then aborts the reusable tunnel.
+	if !c.replyWritten {
+		return c.abortWithErrorLocked(remoteEOFCode, remoteEOFMessage)
+	}
+	c.writeClosed = true
+	c.closeWriteErr = c.session.writer.WriteZeroChunk()
 	return c.closeWriteErr
+}
+
+func (c *serverReuseConn[U]) abortWithErrorLocked(code byte, message string) error {
+	c.writeClosed = true
+	c.closeWriteErr = c.writeErrorResponse(code, message)
+	if c.closeWriteErr == nil {
+		c.aborted.Store(true)
+		c.closeWriteErr = c.session.Conn.Close()
+	}
+	return c.closeWriteErr
+}
+
+func (c *serverReuseConn[U]) HandshakeFailure(err error) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.writeClosed || c.replyWritten || c.session.transport.Reached() {
+		return nil
+	}
+	return c.abortWithErrorLocked(reuse.ErrorReply(err))
 }
 
 func (c *serverReuseConn[U]) Close() error {
 	c.closeOnce.Do(func() {
-		// The handler may close this side while its peer copy is still reading.
-		// onClose owns completion and runs only after both copy directions exit.
-		c.closeErr = c.CloseWrite()
+		// A failed request stream cannot be drained or reused, even if the
+		// response direction already sent its zero chunk.
+		if c.readFailed.Load() || c.session.transport.Reached() {
+			c.aborted.Store(true)
+			c.closeErr = c.session.Conn.Close()
+			return
+		}
+		// Completion wakes Serve before the handler calls Close. Both must
+		// converge here, rather than treating their lock contention as a stuck
+		// writer. Successful completion means both copy directions have exited.
+		select {
+		case <-c.completion:
+			if c.completeErr == nil {
+				c.access.Lock()
+				c.closeErr = c.closeWriteLocked()
+				c.access.Unlock()
+				return
+			}
+		default:
+		}
+		// Before successful completion, interrupt an outstanding write so an
+		// error in the peer copy cannot leave Close blocked on the write lock.
+		if !c.access.TryLock() {
+			c.aborted.Store(true)
+			c.closeErr = c.session.Conn.Close()
+			return
+		}
+		// snell-server closes the tunnel without a reply or zero chunk once the reply has been written,
+		// or when the client stream ends without a zero chunk.
+		if !c.writeClosed && (c.replyWritten || c.session.transport.Reached()) {
+			c.writeClosed = true
+			c.aborted.Store(true)
+			c.closeErr = c.session.Conn.Close()
+		} else {
+			c.closeErr = c.closeWriteLocked()
+		}
+		c.access.Unlock()
 	})
 	return c.closeErr
 }
 
-func (c *serverReuseConn[U]) completeLogicalConnection(error) {
+func (c *serverReuseConn[U]) completeLogicalConnection(err error) {
 	c.completeOnce.Do(func() {
+		c.completeErr = err
 		close(c.completion)
 	})
 }
@@ -422,14 +497,16 @@ func (c *serverReuseConn[U]) InitializeReadWaiter(options N.ReadWaitOptions) (ne
 }
 
 func (c *serverReuseConn[U]) WaitReadBuffer() (*buf.Buffer, error) {
-	buffer, err := c.session.reader.WaitReadBuffer()
-	if errors.Is(err, io.EOF) {
-		c.readClosed.Store(true)
+	if c.readClosed.Load() {
+		return nil, io.EOF
 	}
-	return buffer, err
+	buffer, err := c.session.reader.WaitReadBuffer()
+	return buffer, c.readError(err)
 }
 
 func (c *serverReuseConn[U]) FrontHeadroom() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if c.replyWritten {
 		return snell.HeaderCipherLen
 	}
@@ -457,4 +534,5 @@ var (
 	_ N.VectorisedWriteCreator = (*serverReuseConn[struct{}])(nil)
 	_ N.VectorisedWriter       = (*serverReuseVectorisedWriter[struct{}])(nil)
 	_ N.WriteCloser            = (*serverReuseConn[struct{}])(nil)
+	_ N.HandshakeFailure       = (*serverReuseConn[struct{}])(nil)
 )

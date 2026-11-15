@@ -11,6 +11,7 @@ import (
 
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/internal/reuse"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -131,6 +132,15 @@ func (c *serverPacketConn) readRequestPacketDestination(record *buf.Buffer) (M.S
 }
 
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if !destination.IsIP() {
+		buffer.Release()
+		return nil
+	}
+	addressLength := c.responseAddrLen(destination)
+	if buffer.Len()+addressLength > maxPayload {
+		buffer.Release()
+		return snell.ErrPayloadTooLarge
+	}
 	c.writeAccess.Lock()
 	if c.writer == nil {
 		err := c.writeTunnelReply()
@@ -142,16 +152,8 @@ func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	}
 	recordWriter := c.writer
 	c.writeAccess.Unlock()
-	header := buf.With(buffer.ExtendHeader(c.responseAddrLen(destination)))
-	err := snell.WriteUDPResponseAddress(header, destination)
-	if err != nil {
-		buffer.Release()
-		return err
-	}
-	if buffer.Len() > maxPayload {
-		buffer.Release()
-		return snell.ErrPayloadTooLarge
-	}
+	header := buf.With(buffer.ExtendHeader(addressLength))
+	common.Must(snell.WriteUDPResponseAddress(header, destination))
 	return recordWriter.WritePacketBuffer(buffer)
 }
 
@@ -176,6 +178,27 @@ func (w *serverPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destin
 		buf.ReleaseMulti(buffers)
 		return os.ErrInvalid
 	}
+	var droppedErr error
+	valid := buffers[:0]
+	for index, buffer := range buffers {
+		destination := destinations[index]
+		if !destination.IsIP() {
+			buffer.Release()
+			continue
+		}
+		addressLength := w.conn.responseAddrLen(destination)
+		if buffer.Len()+addressLength > maxPayload {
+			buffer.Release()
+			droppedErr = snell.ErrPayloadTooLarge
+			continue
+		}
+		header := buf.With(buffer.ExtendHeader(addressLength))
+		common.Must(snell.WriteUDPResponseAddress(header, destination))
+		valid = append(valid, buffer)
+	}
+	if len(valid) == 0 {
+		return droppedErr
+	}
 	w.access.Lock()
 	if w.writer == nil {
 		w.conn.writeAccess.Lock()
@@ -184,7 +207,7 @@ func (w *serverPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destin
 			if err != nil {
 				w.conn.writeAccess.Unlock()
 				w.access.Unlock()
-				buf.ReleaseMulti(buffers)
+				buf.ReleaseMulti(valid)
 				return err
 			}
 		}
@@ -193,15 +216,10 @@ func (w *serverPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destin
 	}
 	recordWriter := w.writer
 	w.access.Unlock()
-	for index, buffer := range buffers {
-		header := buf.With(buffer.ExtendHeader(w.conn.responseAddrLen(destinations[index])))
-		err := snell.WriteUDPResponseAddress(header, destinations[index])
-		if err != nil {
-			buf.ReleaseMulti(buffers)
-			return err
-		}
+	if err := recordWriter.WriteVectorised(valid); err != nil {
+		return err
 	}
-	return recordWriter.WriteVectorised(buffers)
+	return droppedErr
 }
 
 func (c *serverPacketConn) writeTunnelReply() error {

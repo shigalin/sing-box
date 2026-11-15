@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"runtime"
 	"testing"
@@ -201,6 +200,10 @@ func testSnellUDPResponseBoundary(t *testing.T, serverVersion int, ipv4Limit int
 		}
 		for _, size := range sizes {
 			t.Run(fmt.Sprintf("%s/size=%d", network, size), func(t *testing.T) {
+				want := bytes.Repeat([]byte{0x73}, size)
+				if size > limit {
+					want = []byte("reply after oversized datagram")
+				}
 				target, err := net.ListenPacket(network, net.JoinHostPort(host, "0"))
 				require.NoError(t, err)
 				done := make(chan struct{})
@@ -219,6 +222,9 @@ func testSnellUDPResponseBoundary(t *testing.T, serverVersion int, ipv4Limit int
 					}
 					payload := bytes.Repeat([]byte{0x73}, int(binary.BigEndian.Uint16(request)))
 					_, e = target.WriteTo(payload, addr)
+					if e == nil && size > limit {
+						_, e = target.WriteTo(want, addr)
+					}
 					sent <- e
 				}()
 				defer func() { target.Close(); <-done }()
@@ -235,13 +241,8 @@ func testSnellUDPResponseBoundary(t *testing.T, serverVersion int, ipv4Limit int
 				}
 				reply := make([]byte, 65535)
 				n, _, err := conn.ReadFrom(reply)
-				if size > limit {
-					require.ErrorIs(t, err, io.EOF, "oversized reply must close the tunnel (received %d bytes)", n)
-					return
-				}
 				require.NoError(t, err)
-				require.Equal(t, size, n)
-				require.Equal(t, bytes.Repeat([]byte{0x73}, size), reply[:n])
+				require.Equal(t, want, reply[:n])
 			})
 		}
 	}

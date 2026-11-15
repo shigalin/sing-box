@@ -73,26 +73,11 @@ func TestPacketAddressPayloadBoundary(t *testing.T) {
 					}
 					return c.WritePacket(buffers[0], addr)
 				}
-				// Reject before encrypting anything, including a valid prefix of a batch.
-				invalid := []*buf.Buffer{makePacket(payloadLimit + 1)}
-				if batch {
-					invalid = append([]*buf.Buffer{makePacket(37)}, invalid...)
-				}
-				errResult := write(invalid)
-				if !errors.Is(errResult, snell.ErrPayloadTooLarge) {
-					t.Fatalf("oversized datagram: %v", errResult)
-				}
-				if wire.Len() != 0 {
-					t.Fatalf("invalid batch emitted %d bytes", wire.Len())
-				}
-				// A rejected batch must not advance the cipher nonce or break later writes.
-				for _, size := range []int{payloadLimit, 37} {
-					if err := write([]*buf.Buffer{makePacket(size)}); err != nil {
-						t.Fatal(err)
-					}
+				checkRecord := func(size int) {
+					t.Helper()
 					record, err := r.ReadRecord()
 					if err != nil {
-						t.Fatalf("decode after rejection: %v", err)
+						t.Fatalf("decode datagram: %v", err)
 					}
 					wantLen := size + c.responseAddrLen(addr)
 					valid := record.Len() == wantLen && bytes.Equal(record.Bytes()[wantLen-size:], bytes.Repeat([]byte{0x73}, size))
@@ -100,6 +85,29 @@ func TestPacketAddressPayloadBoundary(t *testing.T) {
 					if !valid {
 						t.Fatalf("datagram boundary/content changed for %d bytes", size)
 					}
+				}
+
+				// Discard only the oversized datagram, without advancing its cipher nonce.
+				invalid := []*buf.Buffer{makePacket(payloadLimit + 1)}
+				if batch {
+					invalid = []*buf.Buffer{makePacket(37), invalid[0], makePacket(41)}
+				}
+				errResult := write(invalid)
+				if !errors.Is(errResult, snell.ErrPayloadTooLarge) {
+					t.Fatalf("oversized datagram: %v", errResult)
+				}
+				if batch {
+					checkRecord(37)
+					checkRecord(41)
+				}
+				if wire.Len() != 0 {
+					t.Fatalf("oversized datagram emitted %d extra bytes", wire.Len())
+				}
+				for _, size := range []int{payloadLimit, 37} {
+					if err := write([]*buf.Buffer{makePacket(size)}); err != nil {
+						t.Fatal(err)
+					}
+					checkRecord(size)
 				}
 			})
 		}

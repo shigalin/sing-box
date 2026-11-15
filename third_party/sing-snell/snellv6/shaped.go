@@ -8,6 +8,7 @@ import (
 	"time"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/internal/eof"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -304,9 +305,9 @@ type packetVectorisedShapedWriter struct {
 }
 
 func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
-	err := validatePacketVectorBuffers(buffers)
-	if err != nil {
-		return err
+	buffers, messageTooLongErr := filterPacketVectorBuffers(buffers)
+	if len(buffers) == 0 {
+		return messageTooLongErr
 	}
 	var records []*buf.Buffer
 	defer func() {
@@ -325,16 +326,21 @@ func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) er
 		records = append(records, record)
 	}
 	if len(records) == 0 {
-		return nil
+		return messageTooLongErr
 	}
 	flushRecords := records
 	records = nil
-	return w.upstream.WriteVectorised(flushRecords)
+	if err := w.upstream.WriteVectorised(flushRecords); err != nil {
+		return err
+	}
+	return messageTooLongErr
 }
 
 var _ N.VectorisedWriter = (*packetVectorisedShapedWriter)(nil)
 
 func (w *shapedWriter) FrontHeadroom() int {
+	w.access.Lock()
+	defer w.access.Unlock()
 	headroom := w.profile.recordPrefixMax + snell.HeaderCipherLen + w.profile.padMaxHeadroom
 	if !w.saltSent {
 		headroom += w.profile.saltBlockLen
@@ -417,7 +423,7 @@ func (r *shapedReader) read() (*buf.Buffer, error) {
 			_, err = discard.ReadFullFrom(r.upstream, paddingLen)
 			discard.Release()
 			if err != nil {
-				return nil, err
+				return nil, eof.Unexpected(err)
 			}
 		}
 		return nil, io.EOF
@@ -429,7 +435,7 @@ func (r *shapedReader) read() (*buf.Buffer, error) {
 		_, err = padding.ReadFullFrom(r.upstream, paddingLen)
 		if err != nil {
 			padding.Release()
-			return nil, err
+			return nil, eof.Unexpected(err)
 		}
 	}
 	body := r.readWaitOptions.NewBufferSize(payloadLen + snell.AEADTagLen)
@@ -439,7 +445,7 @@ func (r *shapedReader) read() (*buf.Buffer, error) {
 			padding.Release()
 		}
 		body.Release()
-		return nil, err
+		return nil, eof.Unexpected(err)
 	}
 	var paddingBytes []byte
 	if padding != nil {

@@ -1,6 +1,7 @@
 package reuse
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,29 @@ const (
 	RemoteEOFCode    = 0x65
 	RemoteEOFMessage = "Remote EOF"
 )
+
+// snell-server v5.0.1: FUN_0013a740 maps libuv errors to reply codes, 0xff for the rest; FUN_0013f020
+// sends it with the uv_strerror message. v6.0.0rc uses the same table.
+func ErrorReply(err error) (code byte, message string) {
+	switch {
+	case errors.Is(err, errAFNotSupported):
+		return 0x01, "address family not supported"
+	case errors.Is(err, errNetDown):
+		return 0x02, "network is down"
+	case errors.Is(err, errNetUnreachable):
+		return 0x03, "network is unreachable"
+	case errors.Is(err, errConnReset):
+		return 0x04, "connection reset by peer"
+	case errors.Is(err, errTimedOut), E.IsTimeout(err):
+		return 0x05, "connection timed out"
+	case errors.Is(err, errConnRefused):
+		return 0x06, "connection refused"
+	case errors.Is(err, errHostUnreachable):
+		return 0x08, "host is unreachable"
+	default:
+		return 0xff, "Unknown error"
+	}
+}
 
 type State uint8
 
@@ -74,8 +98,8 @@ func (p *Pool[S]) Take() (session S, found bool, closed bool) {
 	var expired []S
 	now := time.Now()
 	if !closed {
-		for element := p.entries.Front(); element != nil; {
-			next := element.Next()
+		for element := p.entries.Back(); element != nil; {
+			next := element.Prev()
 			entry := element.Value
 			state := State(entry.session.ReuseState().Load())
 			if state == StateClosed {

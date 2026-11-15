@@ -61,6 +61,9 @@ jobs:
       - name: Race-test patched dependencies
         if: matrix.os == 'ubuntu-latest'
         run: go test -mod=readonly -race -count=1 -timeout 3m github.com/sagernet/sing-vmess/... github.com/sagernet/sing-quic/... github.com/sagernet/sing-snell/...
+      - name: Test native Windows socket error replies
+        if: matrix.os == 'windows-latest'
+        run: go test -mod=readonly -count=1 github.com/sagernet/sing-snell/internal/reuse
       - name: Race-test authentication and QUIC integration
         if: matrix.os == 'ubuntu-latest'
         working-directory: test

@@ -50,8 +50,22 @@ func TestPacketRecordsPreserveLargeDatagrams(t *testing.T) {
 				if batch {
 					invalid = append([]*buf.Buffer{makePacket(37)}, invalid...)
 				}
-				if err := write(invalid...); !errors.Is(err, snell.ErrPayloadTooLarge) || wire.Len() != 0 {
-					t.Fatalf("oversized packet: wrote %d bytes, error %v", wire.Len(), err)
+				if err := write(invalid...); !errors.Is(err, snell.ErrPayloadTooLarge) {
+					t.Fatalf("oversized packet: error %v", err)
+				}
+				if batch {
+					record, err := reader.NextRecord()
+					if err != nil {
+						t.Fatalf("valid batch prefix dropped: %v", err)
+					}
+					matches := bytes.Equal(record.Bytes(), bytes.Repeat([]byte{0x73}, 37))
+					record.Release()
+					if !matches {
+						t.Fatal("valid batch prefix changed")
+					}
+				}
+				if wire.Len() != 0 {
+					t.Fatalf("oversized packet emitted %d extra bytes", wire.Len())
 				}
 				for _, idle := range []bool{false, true} {
 					if shaped, ok := writer.(*shapedWriter); idle && ok {

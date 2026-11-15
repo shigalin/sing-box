@@ -12,6 +12,7 @@ import (
 	"time"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/internal/eof"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -105,7 +106,7 @@ func (r *reader) ReadRecord() (*buf.Buffer, error) {
 		_, err = padding.ReadFullFrom(r.bufferedUpstream, paddingLen)
 		if err != nil {
 			padding.Release()
-			return nil, err
+			return nil, eof.Unexpected(err)
 		}
 	}
 	body := r.readWaitOptions.NewBufferSize(payloadLen + snell.AEADTagLen)
@@ -115,7 +116,7 @@ func (r *reader) ReadRecord() (*buf.Buffer, error) {
 			padding.Release()
 		}
 		body.Release()
-		return nil, err
+		return nil, eof.Unexpected(err)
 	}
 	if padding != nil {
 		paddingBytes := padding.Bytes()
@@ -536,23 +537,11 @@ func (w *writer) fillPaddingWithBitCount(padding []byte, oneBits int) error {
 }
 
 func (w *writer) Write(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	w.access.Lock()
 	defer w.access.Unlock()
-	if len(p) == 0 {
-		err = w.initialize()
-		if err != nil {
-			return 0, err
-		}
-		nowUnix := time.Now().Unix()
-		payloadLimit := w.payloadLimitFor(nowUnix)
-		if payloadLimit <= 0 || payloadLimit > maxPayload {
-			panic("snell: invalid v4 payload limit")
-		}
-		// Surge 6.7.0 (11520): FUN_100012944 advances the growth window before
-		// calling FUN_100012b24 even when encrypting a zero-length EOF record.
-		w.advancePayloadLimit(payloadLimit, nowUnix)
-		return 0, w.writeSliceRecordLocked(nil, 0)
-	}
 	return w.writeBytesLocked(p)
 }
 
@@ -694,13 +683,19 @@ type packetVectorisedWriter struct {
 }
 
 func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
-	// Validate the whole batch before advancing any nonces. Otherwise a
-	// rejected suffix discards encrypted records that the peer never saw.
+	var messageTooLongErr error
+	valid := buffers[:0]
 	for _, buffer := range buffers {
 		if buffer.Len() > maxPayload {
-			buf.ReleaseMulti(buffers)
-			return snell.ErrPayloadTooLarge
+			buffer.Release()
+			messageTooLongErr = snell.ErrPayloadTooLarge
+			continue
 		}
+		valid = append(valid, buffer)
+	}
+	buffers = valid
+	if len(buffers) == 0 {
+		return messageTooLongErr
 	}
 	var records []*buf.Buffer
 	defer func() {
@@ -736,11 +731,14 @@ func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 		records = append(records, record)
 	}
 	if len(records) == 0 {
-		return nil
+		return messageTooLongErr
 	}
 	flushRecords := records
 	records = nil
-	return w.upstream.WriteVectorised(flushRecords)
+	if err := w.upstream.WriteVectorised(flushRecords); err != nil {
+		return err
+	}
+	return messageTooLongErr
 }
 
 func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {

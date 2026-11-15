@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -81,6 +83,73 @@ func TestPacketAddressPayloadBoundary(t *testing.T) {
 				if !matches || gotAddress != address || wire.Len() != 0 {
 					t.Fatalf("boundary packet changed: address %v, payload matches %v, %d bytes left", gotAddress, matches, wire.Len())
 				}
+			}
+		})
+	}
+}
+
+func TestServerPacketBatchResponseBoundary(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []Mode{ModeDefault, ModeUnshaped, ModeUnsafeRaw} {
+		t.Run(mode.String(), func(t *testing.T) {
+			t.Parallel()
+			for _, address := range []string{"127.0.0.1:53", "[::1]:53"} {
+				t.Run(address, func(t *testing.T) {
+					t.Parallel()
+					var wire bytes.Buffer
+					psk := []byte("server-batch-boundary")
+					profile := NewProfile(psk)
+					writer, err := writeFirstRecord(&wire, mode, psk, profile, []byte{snell.ReplyTunnel})
+					if err != nil {
+						t.Fatal(err)
+					}
+					reader, reply, err := readFirstRecord(&wire, mode, psk, profile, N.ReadWaitOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					reply.Release()
+					server := &serverPacketConn{service: &Service{mode: mode, profile: profile}, writer: writer}
+					client := &clientPacketConn{reader: reader}
+					batch := &serverPacketBatchWriter{conn: server, upstream: bufio.NewVectorisedWriter(&wire)}
+					addr := M.ParseSocksaddr(address)
+					limit := maxPayload - server.responseAddrLen(addr)
+					options := N.NewReadWaitOptions(nil, server)
+					makePacket := func(size int) *buf.Buffer {
+						packet := options.NewBufferSize(size)
+						copy(packet.Extend(size), bytes.Repeat([]byte{0x73}, size))
+						options.PostReturn(packet)
+						return packet
+					}
+					checkPacket := func(size int) {
+						t.Helper()
+						packet, source, err := client.WaitReadPacket()
+						if err != nil {
+							t.Fatal(err)
+						}
+						matches := bytes.Equal(packet.Bytes(), bytes.Repeat([]byte{0x73}, size))
+						packet.Release()
+						if source != addr || !matches {
+							t.Fatalf("response changed: source %v, payload matches %v", source, matches)
+						}
+					}
+					packets := []*buf.Buffer{makePacket(37), makePacket(limit + 1), makePacket(11), makePacket(41)}
+					destinations := []M.Socksaddr{addr, addr, M.ParseSocksaddr("example.org:53"), addr}
+					if err := batch.WritePacketBatch(packets, destinations); !errors.Is(err, snell.ErrPayloadTooLarge) {
+						t.Fatalf("oversized batch error: %v", err)
+					}
+					checkPacket(37)
+					checkPacket(41)
+					if wire.Len() != 0 {
+						t.Fatalf("invalid responses emitted %d extra bytes", wire.Len())
+					}
+					if err := batch.WritePacketBatch([]*buf.Buffer{makePacket(limit)}, []M.Socksaddr{addr}); err != nil {
+						t.Fatal(err)
+					}
+					checkPacket(limit)
+					if wire.Len() != 0 {
+						t.Fatalf("boundary response left %d bytes", wire.Len())
+					}
+				})
 			}
 		})
 	}

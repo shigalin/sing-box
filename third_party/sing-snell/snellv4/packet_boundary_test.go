@@ -67,7 +67,7 @@ func TestPacketAddressPayloadBoundary(t *testing.T) {
 					}
 					return c.WritePacket(buffers[0], addr)
 				}
-				// Reject before encrypting anything, including a valid prefix of a batch.
+				// Drop only the oversized datagram; preserve the valid batch prefix.
 				invalid := []*buf.Buffer{makePacket(payloadLimit + 1)}
 				if batch {
 					invalid = append([]*buf.Buffer{makePacket(37)}, invalid...)
@@ -76,10 +76,22 @@ func TestPacketAddressPayloadBoundary(t *testing.T) {
 				if !errors.Is(errResult, snell.ErrPayloadTooLarge) {
 					t.Fatalf("oversized datagram: %v", errResult)
 				}
-				if wire.Len() != 0 {
-					t.Fatalf("invalid batch emitted %d bytes", wire.Len())
+				if batch {
+					record, err := r.ReadRecord()
+					if err != nil {
+						t.Fatalf("valid batch prefix dropped: %v", err)
+					}
+					wantLen := 37 + 1 + c.udpRequestAddrLen(addr)
+					valid := record.Len() == wantLen && bytes.Equal(record.Bytes()[wantLen-37:], bytes.Repeat([]byte{0x73}, 37))
+					record.Release()
+					if !valid {
+						t.Fatal("valid batch prefix changed")
+					}
 				}
-				// A rejected batch must not advance the cipher nonce or break later writes.
+				if wire.Len() != 0 {
+					t.Fatalf("oversized datagram emitted %d extra bytes", wire.Len())
+				}
+				// Dropping one datagram must not break later cipher nonces or writes.
 				for _, size := range []int{payloadLimit, 37} {
 					if err := write([]*buf.Buffer{makePacket(size)}); err != nil {
 						t.Fatal(err)

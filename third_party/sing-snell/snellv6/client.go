@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	snell "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/internal/eof"
 	"github.com/sagernet/sing-snell/internal/reuse"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -153,7 +154,7 @@ func (c *clientConn) readResponse() error {
 	if c.reader != nil {
 		return nil
 	}
-	reader, record, err := readFirstRecord(c.Conn, c.client.mode, c.client.psk, c.client.profile, c.readWaitOptions)
+	reader, record, err := readFirstRecord(eof.UnexpectedReader{Reader: c.Conn}, c.client.mode, c.client.psk, c.client.profile, c.readWaitOptions)
 	if err != nil {
 		return E.Cause(err, "read reply")
 	}
@@ -183,9 +184,6 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *clientConn) Write(p []byte) (int, error) {
-	if c.writer != nil {
-		return c.writer.Write(p)
-	}
 	c.access.Lock()
 	if c.writer != nil {
 		c.access.Unlock()
@@ -200,9 +198,6 @@ func (c *clientConn) Write(p []byte) (int, error) {
 }
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteBuffer(buffer)
-	}
 	c.access.Lock()
 	if c.writer != nil {
 		c.access.Unlock()
@@ -227,9 +222,6 @@ type clientVectorisedWriter struct {
 
 func (w *clientVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
-	if conn.writer != nil {
-		return conn.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
-	}
 	conn.access.Lock()
 	if conn.writer != nil {
 		recordWriter := conn.writer
@@ -295,6 +287,8 @@ func (c *clientConn) CreateReadWaiter() (N.ReadWaiter, bool) {
 }
 
 func (c *clientConn) FrontHeadroom() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if c.writer != nil {
 		return c.writer.FrontHeadroom()
 	}
@@ -310,6 +304,8 @@ func (c *clientConn) FrontHeadroom() int {
 }
 
 func (c *clientConn) RearHeadroom() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if c.writer != nil {
 		return c.writer.RearHeadroom()
 	}
@@ -320,6 +316,8 @@ func (c *clientConn) RearHeadroom() int {
 }
 
 func (c *clientConn) WriterMTU() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if c.writer != nil {
 		return c.writer.WriterMTU()
 	}
@@ -334,6 +332,8 @@ func (c *clientConn) NeedHandshakeForRead() bool {
 }
 
 func (c *clientConn) NeedHandshakeForWrite() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return c.writer == nil
 }
 
