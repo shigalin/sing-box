@@ -164,18 +164,20 @@ type serverReuseConn[U comparable] struct {
 	net.Conn
 	session *serverReuseSession[U]
 
-	access        sync.Mutex
-	closeWriteErr error
-	closeOnce     sync.Once
-	closeErr      error
-	readClosed    atomic.Bool
-	readFailed    atomic.Bool
-	aborted       atomic.Bool
-	replyWritten  bool
-	writeClosed   bool
-	completeOnce  sync.Once
-	completion    chan struct{}
-	completeErr   error
+	access           sync.Mutex
+	closed           atomic.Bool
+	writeActionCount atomic.Int32
+	closeWriteErr    error
+	closeOnce        sync.Once
+	closeErr         error
+	readClosed       atomic.Bool
+	readFailed       atomic.Bool
+	aborted          atomic.Bool
+	replyWritten     bool
+	writeClosed      bool
+	completeOnce     sync.Once
+	completion       chan struct{}
+	completeErr      error
 }
 
 func (c *serverReuseConn[U]) writeFirstResponse(payload []byte) error {
@@ -333,9 +335,11 @@ func (c *serverReuseConn[U]) readError(err error) error {
 }
 
 func (c *serverReuseConn[U]) Write(p []byte) (int, error) {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
-	if c.writeClosed {
+	if c.writeClosed || c.closed.Load() {
 		return 0, net.ErrClosed
 	}
 	if c.replyWritten {
@@ -349,9 +353,11 @@ func (c *serverReuseConn[U]) Write(p []byte) (int, error) {
 }
 
 func (c *serverReuseConn[U]) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
-	if c.writeClosed {
+	if c.writeClosed || c.closed.Load() {
 		buffer.Release()
 		return net.ErrClosed
 	}
@@ -376,9 +382,11 @@ type serverReuseVectorisedWriter[U comparable] struct {
 
 func (w *serverReuseVectorisedWriter[U]) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
+	conn.writeActionCount.Add(1)
+	defer conn.writeActionCount.Add(-1)
 	conn.access.Lock()
 	defer conn.access.Unlock()
-	if conn.writeClosed {
+	if conn.writeClosed || conn.closed.Load() {
 		buf.ReleaseMulti(buffers)
 		return net.ErrClosed
 	}
@@ -404,8 +412,13 @@ func (w *serverReuseVectorisedWriter[U]) WriteVectorised(buffers []*buf.Buffer) 
 }
 
 func (c *serverReuseConn[U]) CloseWrite() error {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
 	return c.closeWriteLocked()
 }
 
@@ -434,9 +447,11 @@ func (c *serverReuseConn[U]) abortWithErrorLocked(code byte, message string) err
 }
 
 func (c *serverReuseConn[U]) HandshakeFailure(err error) error {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
-	if c.writeClosed || c.replyWritten || c.session.transport.Reached() {
+	if c.closed.Load() || c.writeClosed || c.replyWritten || c.session.transport.Reached() {
 		return nil
 	}
 	return c.abortWithErrorLocked(reuse.ErrorReply(err))
@@ -444,6 +459,7 @@ func (c *serverReuseConn[U]) HandshakeFailure(err error) error {
 
 func (c *serverReuseConn[U]) Close() error {
 	c.closeOnce.Do(func() {
+		c.closed.Store(true)
 		// A failed request stream cannot be drained or reused, even if the
 		// response direction already sent its zero chunk.
 		if c.readFailed.Load() || c.session.transport.Reached() {
@@ -467,9 +483,14 @@ func (c *serverReuseConn[U]) Close() error {
 		// Before successful completion, interrupt an outstanding write so an
 		// error in the peer copy cannot leave Close blocked on the write lock.
 		if !c.access.TryLock() {
-			c.aborted.Store(true)
-			c.closeErr = c.session.Conn.Close()
-			return
+			if c.writeActionCount.Load() > 0 {
+				c.aborted.Store(true)
+				c.closeErr = c.session.Conn.Close()
+				return
+			}
+			// Only metadata is holding the lock. New write actions observe closed
+			// under access and cannot start network I/O while Close waits.
+			c.access.Lock()
 		}
 		// snell-server closes the tunnel without a reply or zero chunk once the reply has been written,
 		// or when the client stream ends without a zero chunk.

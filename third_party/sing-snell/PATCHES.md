@@ -86,3 +86,10 @@ Client Close interrupts only pending writes, so metadata reads that briefly
 hold the writer lock no longer prevent reuse. Deadlines set on a closed
 logical connection return net.ErrClosed instead of reaching the pooled
 transport.
+
+Server reuse Close also distinguishes pending write actions from metadata reads.
+Before successful completion it interrupts pending writes, but waits for a
+metadata-only lock holder. Once Close starts, new Write, WriteBuffer,
+vectorised writes, CloseWrite and handshake error replies cannot start network
+I/O on the old logical connection. Regressions cover metadata contention,
+blocked data/EOF writes and writes after the transport is reusable.
