@@ -472,6 +472,7 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 	if c.writer == nil {
+		defer buffer.Release()
 		return c.writeHandshake(buffer.Bytes())
 	}
 	return c.writer.WriteBuffer(buffer)
@@ -540,6 +541,10 @@ func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 	}
 	destination = c.destination
 	return
+}
+
+func (c *clientPacketConn) RemoteAddr() net.Addr {
+	return c.destination
 }
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {

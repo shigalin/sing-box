@@ -39,6 +39,10 @@ func (c *XUDPConn) Write(p []byte) (n int, err error) {
 	return c.WriteTo(p, c.destination)
 }
 
+func (c *XUDPConn) RemoteAddr() net.Addr {
+	return c.destination
+}
+
 func (c *XUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	buffer := buf.With(p)
 	var destination M.Socksaddr
@@ -154,6 +158,7 @@ func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) erro
 		)
 		err := AddressSerializer.WriteAddrPort(header, destination)
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 		common.Must(binary.Write(header, binary.BigEndian, uint16(dataLen)))
@@ -168,6 +173,7 @@ func (c *XUDPConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) erro
 		header[6] = NetworkUDP
 		err := AddressSerializer.WriteAddrPort(buf.With(header[7:]), destination)
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 		binary.BigEndian.PutUint16(header[7+addrLen:], uint16(dataLen))
