@@ -77,6 +77,48 @@ func TestPacketRecordsPreserveLargeDatagrams(t *testing.T) {
 	}
 }
 
+// An oversized datagram must not discard the valid datagrams in its batch.
+func TestPacketVectorKeepsValidDatagramsAroundOversized(t *testing.T) {
+	t.Parallel()
+
+	var wire bytes.Buffer
+	aead, err := snell.NewAEAD(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := newWriter(&wire, aead, make([]byte, snell.NonceLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newReader(&wire, aead, make([]byte, snell.NonceLen))
+	newPacket := func(payload []byte) *buf.Buffer {
+		b := buf.NewSize(w.FrontHeadroom() + len(payload) + w.RearHeadroom())
+		b.Resize(w.FrontHeadroom(), 0)
+		b.Write(payload)
+		return b
+	}
+	first, last := []byte("before oversized"), []byte("after oversized")
+	batch := []*buf.Buffer{newPacket(first), newPacket(make([]byte, maxPayload+1)), newPacket(last)}
+	err = w.CreatePacketVectorisedWriterFor(packetTestVectorWriter{&wire}).WriteVectorised(batch)
+	if !errors.Is(err, snell.ErrPayloadTooLarge) {
+		t.Fatalf("mixed batch: %v", err)
+	}
+	for _, want := range [][]byte{first, last} {
+		record, err := r.ReadRecord()
+		if err != nil {
+			t.Fatalf("read %q: %v", want, err)
+		}
+		same := bytes.Equal(record.Bytes(), want)
+		record.Release()
+		if !same {
+			t.Fatalf("datagram %q changed", want)
+		}
+	}
+	if wire.Len() != 0 {
+		t.Fatalf("%d unexpected bytes after valid datagrams", wire.Len())
+	}
+}
+
 type packetTestVectorWriter struct{ *bytes.Buffer }
 
 func (w packetTestVectorWriter) WriteVectorised(buffers []*buf.Buffer) error {

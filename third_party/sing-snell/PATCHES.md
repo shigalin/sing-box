@@ -25,7 +25,11 @@ v4/v5 and 0xffff for v6) after adding their actual address header. This
 preserves valid datagrams and rejects oversized datagrams before a truncated
 prefix can be forwarded. Record writers preflight their input before changing
 cipher state. The v5/v6 server batch writers filter invalid responses before
-passing the remaining datagrams to the record writers.
+passing the remaining datagrams to the record writers. snellv4/record.go,
+snellv5/record.go and snellv6/record.go match upstream 04667b0, and
+snellv6/shaped.go differs from it only by the FrontHeadroom lock: the packet
+record writers drop only the oversized datagrams of a batch, send the rest and
+report EMSGSIZE.
 
 The v5/v6 servers pass the first UDP datagram from WaitReadPacket directly to
 the routing layer. They advertise a ReaderMTU so routing can size its sniffing
