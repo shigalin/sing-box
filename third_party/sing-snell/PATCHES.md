@@ -27,9 +27,16 @@ prefix can be forwarded. Record writers preflight their input before changing
 cipher state. The v5/v6 server batch writers filter invalid responses before
 passing the remaining datagrams to the record writers. snellv4/record.go,
 snellv5/record.go and snellv6/record.go match upstream 04667b0, and
-snellv6/shaped.go differs from it only by the FrontHeadroom lock: the packet
-record writers drop only the oversized datagrams of a batch, send the rest and
-report EMSGSIZE.
+snellv6/shaped.go differs from it only by the FrontHeadroom lock and the
+headroom fallback below: the packet record writers drop only the oversized
+datagrams of a batch, send the rest and report EMSGSIZE.
+
+snellv6/shaped.go also incorporates the unmerged upstream PR #5 (f2a0337): a
+shaped record whose input buffer lacks the required front headroom or AEAD-tag
+tailroom is written through an allocated record instead of panicking. Callers
+can receive such buffers when a lazy-headroom upstream (for example an early
+data WebSocket detour) collapses the calculated headroom to 1024 bytes, below
+the shaped profile maximum. snellv6/shaped_test.go is the PR's regression test.
 
 The v5/v6 servers pass the first UDP datagram from WaitReadPacket directly to
 the routing layer. They advertise a ReaderMTU so routing can size its sniffing
