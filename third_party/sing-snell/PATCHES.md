@@ -78,3 +78,7 @@ streams instead of draining them, while healthy upload drains still permit the
 next request. Client read completion and Close share a lock for the pool handoff,
 without holding it during transport reads. Non-reusable connection writer
 publication and shaped-writer headroom reads are synchronized as well.
+Client Close interrupts only pending writes, so metadata reads that briefly
+hold the writer lock no longer prevent reuse. Deadlines set on a closed
+logical connection return net.ErrClosed instead of reaching the pooled
+transport.

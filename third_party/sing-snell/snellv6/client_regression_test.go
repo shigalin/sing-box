@@ -299,6 +299,88 @@ func TestReuseCloseInterruptsBlockedWrite(t *testing.T) {
 	}
 }
 
+// newFinishedReuseConn returns a logical connection whose reply has reached
+// EOF, so Close can return its session to the pool.
+func newFinishedReuseConn(t *testing.T, psk []byte) (*Client, *reuseSession, *reuseConn) {
+	t.Helper()
+	var wire bytes.Buffer
+	w, err := writeFirstRecord(&wire, ModeUnsafeRaw, psk, nil, []byte{snell.ReplyTunnel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteZeroChunk(); err != nil {
+		t.Fatal(err)
+	}
+	client, _ := NewClient(ClientOptions{PSK: psk, Reuse: true, Mode: ModeUnsafeRaw})
+	t.Cleanup(func() { client.Close() })
+	local, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	go io.Copy(io.Discard, peer)
+	go peer.Write(wire.Bytes())
+	session := client.newReuseSession(local)
+	session.state.Store(uint32(reuse.StateActive))
+	t.Cleanup(func() { session.Close() })
+	connection, err := session.DialConn(M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := connection.(*reuseConn)
+	if _, err := conn.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("reply EOF: %v", err)
+	}
+	return client, session, conn
+}
+
+func TestReuseCloseWaitsForMetadataLock(t *testing.T) {
+	client, session, conn := newFinishedReuseConn(t, []byte("metadata-close-key"))
+	// Holding the lock without a pending write stands in for a metadata read
+	// such as FrontHeadroom.
+	conn.access.Lock()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- conn.Close() }()
+	select {
+	case err := <-closeDone:
+		conn.access.Unlock()
+		t.Fatalf("Close treated a metadata read as a blocked write: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	conn.access.Unlock()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after the metadata read")
+	}
+	if taken, found, _ := client.pool.Take(); !found || taken != session {
+		t.Fatal("session was not returned to the pool")
+	}
+}
+
+func TestReuseClosedConnDeadlinesDoNotReachSession(t *testing.T) {
+	client, session, conn := newFinishedReuseConn(t, []byte("closed-deadline-key"))
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Second)
+	for name, set := range map[string]func(time.Time) error{
+		"deadline": conn.SetDeadline,
+		"read":     conn.SetReadDeadline,
+		"write":    conn.SetWriteDeadline,
+	} {
+		if err := set(past); !errors.Is(err, net.ErrClosed) {
+			t.Errorf("%s deadline after Close: %v", name, err)
+		}
+	}
+	if taken, found, _ := client.pool.Take(); !found || taken != session {
+		t.Fatal("deadline after Close evicted the pooled session")
+	}
+}
+
 type singleConnDialer struct {
 	N.Dialer
 	conn  net.Conn

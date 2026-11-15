@@ -200,18 +200,20 @@ type reuseConn struct {
 	session     *reuseSession
 	destination M.Socksaddr
 
-	access          sync.Mutex
-	readAccess      sync.Mutex
-	writer          reuse.RecordWriter
-	writeClosed     bool
-	closeWriteErr   error
-	closeOnce       sync.Once
-	closeErr        error
-	replyRead       atomic.Bool
-	readWaitOptions N.ReadWaitOptions
-	closed          atomic.Bool
-	readActionCount atomic.Int32
-	readClosed      atomic.Bool
+	access           sync.Mutex
+	readAccess       sync.Mutex
+	deadlineAccess   sync.Mutex
+	writer           reuse.RecordWriter
+	writeClosed      bool
+	closeWriteErr    error
+	closeOnce        sync.Once
+	closeErr         error
+	replyRead        atomic.Bool
+	readWaitOptions  N.ReadWaitOptions
+	closed           atomic.Bool
+	readActionCount  atomic.Int32
+	writeActionCount atomic.Int32
+	readClosed       atomic.Bool
 }
 
 func (c *reuseConn) readResponse() error {
@@ -237,6 +239,14 @@ func (c *reuseConn) readResponse() error {
 	return nil
 }
 
+// unlockRead releases readAccess around a transport read so Close can decide
+// between reuse and drain while the read is blocked.
+func (c *reuseConn) unlockRead(read func()) {
+	c.readAccess.Unlock()
+	defer c.readAccess.Lock()
+	read()
+}
+
 func (c *reuseConn) Read(p []byte) (int, error) {
 	c.readAccess.Lock()
 	defer c.readAccess.Unlock()
@@ -251,17 +261,15 @@ func (c *reuseConn) Read(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	c.readAccess.Unlock()
-	err := c.readResponse()
-	c.readAccess.Lock()
+	var err error
+	c.unlockRead(func() { err = c.readResponse() })
 	if err != nil {
 		return 0, err
 	}
 	var discarded int
 	for {
-		c.readAccess.Unlock()
-		n, err := c.session.reader.Read(p)
-		c.readAccess.Lock()
+		var n int
+		c.unlockRead(func() { n, err = c.session.reader.Read(p) })
 		if c.closed.Load() {
 			discarded += n
 			if errors.Is(err, io.EOF) {
@@ -300,18 +308,15 @@ func (c *reuseConn) ReadBuffer(buffer *buf.Buffer) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	c.readAccess.Unlock()
-	err := c.readResponse()
-	c.readAccess.Lock()
+	var err error
+	c.unlockRead(func() { err = c.readResponse() })
 	if err != nil {
 		return err
 	}
 	var discarded int
 	for {
 		bufferLen := buffer.Len()
-		c.readAccess.Unlock()
-		err = c.session.reader.ReadBuffer(buffer)
-		c.readAccess.Lock()
+		c.unlockRead(func() { err = c.session.reader.ReadBuffer(buffer) })
 		if c.closed.Load() {
 			discarded += buffer.Len() - bufferLen
 			buffer.Truncate(bufferLen)
@@ -396,6 +401,8 @@ func (c *reuseConn) writeRequestBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *reuseConn) Write(p []byte) (int, error) {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
 	if c.writeClosed || c.closed.Load() {
@@ -412,6 +419,8 @@ func (c *reuseConn) Write(p []byte) (int, error) {
 }
 
 func (c *reuseConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
 	if c.writeClosed || c.closed.Load() {
@@ -439,6 +448,8 @@ type reuseVectorisedWriter struct {
 
 func (w *reuseVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
+	conn.writeActionCount.Add(1)
+	defer conn.writeActionCount.Add(-1)
 	conn.access.Lock()
 	defer conn.access.Unlock()
 	if conn.writeClosed || conn.closed.Load() {
@@ -467,6 +478,8 @@ func (w *reuseVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 }
 
 func (c *reuseConn) CloseWrite() error {
+	c.writeActionCount.Add(1)
+	defer c.writeActionCount.Add(-1)
 	c.access.Lock()
 	defer c.access.Unlock()
 	return c.closeWriteLocked()
@@ -490,12 +503,24 @@ func (c *reuseConn) closeWriteLocked() error {
 func (c *reuseConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		if !c.replyRead.Load() || !c.access.TryLock() {
+		if !c.replyRead.Load() {
 			c.session.Release(false)
 			return
 		}
+		if !c.access.TryLock() {
+			// Interrupt a write that may be blocked on the transport. Other holders
+			// are brief metadata reads; writes started after closed is set fail fast,
+			// except CloseWrite, which sends the zero chunk Close would send anyway.
+			if c.writeActionCount.Load() > 0 {
+				c.session.Release(false)
+				return
+			}
+			c.access.Lock()
+		}
+		c.deadlineAccess.Lock()
 		c.session.Conn.SetReadDeadline(time.Time{})
 		c.session.Conn.SetWriteDeadline(time.Time{})
+		c.deadlineAccess.Unlock()
 		c.closeErr = c.closeWriteLocked()
 		c.access.Unlock()
 		if c.closeErr != nil {
@@ -532,6 +557,35 @@ func (c *reuseConn) Close() error {
 	return c.closeErr
 }
 
+// The transport outlives this logical connection, so deadlines set after Close
+// must not reach a pooled or reused session.
+func (c *reuseConn) SetDeadline(t time.Time) error {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *reuseConn) SetReadDeadline(t time.Time) error {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *reuseConn) SetWriteDeadline(t time.Time) error {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
 func (c *reuseConn) CreateReadWaiter() (N.ReadWaiter, bool) {
 	return &reuseReadWaiter{conn: c}, true
 }
@@ -562,17 +616,15 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 	if w.conn.closed.Load() {
 		return nil, net.ErrClosed
 	}
-	w.conn.readAccess.Unlock()
-	err := w.conn.readResponse()
-	w.conn.readAccess.Lock()
+	var err error
+	w.conn.unlockRead(func() { err = w.conn.readResponse() })
 	if err != nil {
 		return nil, err
 	}
 	var discarded int
 	for {
-		w.conn.readAccess.Unlock()
-		buffer, err := w.conn.session.reader.WaitReadBuffer()
-		w.conn.readAccess.Lock()
+		var buffer *buf.Buffer
+		w.conn.unlockRead(func() { buffer, err = w.conn.session.reader.WaitReadBuffer() })
 		if w.conn.closed.Load() {
 			if buffer != nil {
 				discarded += buffer.Len()
